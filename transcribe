@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# Whisper transcription script with speaker diarization
+# Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE]
+#   audio_file  - path to audio/video file (m4a, mp3, wav, mp4, etc.)
+#   --model     - tiny, base, small, medium, large-v3 (default: medium)
+#   --language  - en, nl, fr, de, auto (default: auto-detect)
+#   --prompt    - path to a text file with vocabulary/context hints for Whisper
+#
+# Credentials (read at runtime, never baked into the image):
+#   ~/.config/whisper/hf-token  - HuggingFace token for diarization + faster downloads
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+IMAGE="whisper-transcribe"
+MODEL="medium"
+LANGUAGE=""
+INPUT_FILE=""
+PROMPT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model|-m)
+            MODEL="$2"; shift 2 ;;
+        --language|-l)
+            LANGUAGE="$2"; shift 2 ;;
+        --prompt|-p)
+            PROMPT_FILE="$2"; shift 2 ;;
+        -h|--help)
+            head -8 "$0"; exit 0 ;;
+        -*)
+            echo "Unknown option: $1"; exit 1 ;;
+        *)
+            INPUT_FILE="$(realpath "$1")"; shift ;;
+    esac
+done
+
+if [ -z "$INPUT_FILE" ]; then
+    echo "Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE]"
+    exit 1
+fi
+
+INPUT_BASE="$(basename "${INPUT_FILE%.*}")"
+INPUT_EXT="${INPUT_FILE##*.}"
+INPUT_DIR="$(dirname "$INPUT_FILE")"
+
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "Error: File not found: $INPUT_FILE"
+    exit 1
+fi
+
+# Build Docker mount arguments
+DOCKER_ARGS=("-v" "$INPUT_DIR:/audio")
+
+# Handle prompt file
+PROMPT_PYTHON="initial_prompt = None"
+if [ -n "$PROMPT_FILE" ]; then
+    PROMPT_FILE="$(realpath "$PROMPT_FILE")"
+    if [ ! -f "$PROMPT_FILE" ]; then
+        echo "Error: Prompt file not found: $PROMPT_FILE"
+        exit 1
+    fi
+    PROMPT_DIR="$(dirname "$PROMPT_FILE")"
+    PROMPT_NAME="$(basename "$PROMPT_FILE")"
+    DOCKER_ARGS+=("-v" "$PROMPT_DIR:/prompt")
+    PROMPT_PYTHON="
+with open('/prompt/$PROMPT_NAME', 'r') as f:
+    initial_prompt = f.read().strip()
+print(f'Using prompt ({len(initial_prompt)} chars)')
+"
+fi
+
+# Mount HF token from ~/.config/whisper/hf-token if available
+HF_TOKEN_PYTHON="hf_token = None"
+if [ -f "$HOME/.config/whisper/hf-token" ]; then
+    DOCKER_ARGS+=("-v" "$HOME/.config/whisper/hf-token:/run/secrets/hf-token:ro")
+    HF_TOKEN_PYTHON="
+with open('/run/secrets/hf-token') as f:
+    hf_token = f.read().strip()
+print('HF token loaded')
+"
+fi
+
+# Build image if not present
+if ! docker image inspect "$IMAGE" &>/dev/null; then
+    echo "Building Whisper image..."
+    docker build -t "$IMAGE" "$SCRIPT_DIR"
+fi
+
+# Stop Ollama to free VRAM
+OLLAMA_WAS_ACTIVE=false
+if systemctl is-active --quiet ollama 2>/dev/null; then
+    OLLAMA_WAS_ACTIVE=true
+    echo "Stopping Ollama to free GPU memory..."
+    sudo systemctl stop ollama
+    sleep 2
+fi
+
+# Ensure Ollama restarts on exit (even on error)
+cleanup() {
+    if $OLLAMA_WAS_ACTIVE; then
+        echo "Restarting Ollama..."
+        sudo systemctl start ollama
+    fi
+}
+trap cleanup EXIT
+
+# Language flag
+LANG_FLAG=""
+if [ -n "$LANGUAGE" ] && [ "$LANGUAGE" != "auto" ]; then
+    LANG_FLAG="'$LANGUAGE'"
+else
+    LANG_FLAG="None"
+fi
+
+echo "Transcribing: $INPUT_BASE"
+echo "Model: $MODEL"
+echo "Output: $INPUT_DIR/$INPUT_BASE.txt"
+[ -n "$PROMPT_FILE" ] && echo "Prompt: $(basename "$PROMPT_FILE")"
+
+# Create persistent volume for HuggingFace model cache (survives container restarts)
+docker volume create whisper-hf-cache &>/dev/null
+DOCKER_ARGS+=("-v" "whisper-hf-cache:/root/.cache/huggingface")
+
+docker run --rm --gpus all \
+    "${DOCKER_ARGS[@]}" \
+    "$IMAGE" \
+"
+import sys, time, os
+import whisperx
+import torch
+
+audio_file = '/audio/$INPUT_BASE.$INPUT_EXT'
+language = $LANG_FLAG
+
+$HF_TOKEN_PYTHON
+
+# Set HF token for all downloads if available
+if hf_token:
+    os.environ['HF_TOKEN'] = hf_token
+    os.environ['HUGGING_FACE_HUB_TOKEN'] = hf_token
+
+$PROMPT_PYTHON
+
+print(f'Loading model: $MODEL ...')
+model_path = '/opt/whisper-models/large-v3' if '$MODEL' == 'large-v3' else '$MODEL'
+asr_opts = {
+    'beam_size': 10,
+    'best_of': 10,
+    'temperatures': [0],
+    'condition_on_previous_text': True,
+    'compression_ratio_threshold': 2.4,
+    'no_speech_threshold': 0.6,
+    'log_prob_threshold': -1.0,
+}
+if initial_prompt:
+    asr_opts['initial_prompt'] = initial_prompt
+model = whisperx.load_model(model_path, device='cuda', compute_type='float16', language=language, asr_options=asr_opts)
+print('Model loaded.')
+
+print(f'Loading audio: {audio_file}')
+audio = whisperx.load_audio(audio_file)
+
+print('Transcribing (max quality mode)...')
+start = time.time()
+result = model.transcribe(
+    audio,
+    batch_size=8,
+    language=language,
+)
+elapsed = time.time() - start
+duration = result['segments'][-1]['end'] if result['segments'] else 0
+print(f'Transcription done in {elapsed:.1f}s ({duration/elapsed:.1f}x realtime)')
+print(f'Detected language: {result[\"language\"]}')
+print(f'Segments: {len(result[\"segments\"])}')
+print()
+
+# Align segments for precise timestamps
+print('Aligning segments...')
+try:
+    model_a, metadata = whisperx.load_align_model(language_code=result['language'], device='cuda')
+    result = whisperx.align(result['segments'], model_a, metadata, audio, 'cuda')
+    del model_a
+    torch.cuda.empty_cache()
+    print('Alignment done.')
+except Exception as e:
+    print(f'Alignment skipped: {e}')
+    print('(To pre-download: run with --align-only once the model downloads finish)')
+print()
+
+# Speaker diarization
+if hf_token:
+    print('Running speaker diarization...')
+    from pyannote.audio import Pipeline as PyannotePipeline
+    import torchaudio
+    diarize_pipeline = PyannotePipeline.from_pretrained('pyannote/speaker-diarization-3.1', token=hf_token)
+    diarize_pipeline = diarize_pipeline.to(torch.device('cuda'))
+    # Load audio as wav tensor (pyannote can't decode m4a directly)
+    wav_audio, sr = torchaudio.load(audio_file)
+    diarize_input = {'waveform': wav_audio, 'sample_rate': sr}
+    diarize_segments = diarize_pipeline(diarize_input)
+    # Handle both old Annotation and new DiarizeOutput formats
+    try:
+        diarize_df = [{'start': turn.start, 'end': turn.end, 'speaker': speaker}
+                      for turn, _, speaker in diarize_segments.itertracks(yield_label=True)]
+    except AttributeError:
+        annotation = diarize_segments.speaker_diarization
+        diarize_df = [{'start': turn.start, 'end': turn.end, 'speaker': speaker}
+                      for turn, _, speaker in annotation.itertracks(yield_label=True)]
+    import pandas as pd
+    diarize_df = pd.DataFrame(diarize_df)
+    result = whisperx.assign_word_speakers(diarize_df, result)
+    del diarize_pipeline
+    torch.cuda.empty_cache()
+    print('Diarization done.')
+else:
+    print('Skipping speaker diarization (no HF token).')
+    print('To enable: save token to ~/.config/whisper/hf-token')
+print()
+
+# Print and save
+text_lines = []
+current_speaker = None
+for seg in result['segments']:
+    speaker = seg.get('speaker', 'SPEAKER_UNKNOWN')
+    line = seg['text'].strip()
+    if not line:
+        continue
+    pct = seg['end'] / duration * 100 if duration > 0 else 0
+    print(f'[{pct:5.1f}%] [{speaker}] {line}')
+    if speaker != current_speaker:
+        text_lines.append('')
+        text_lines.append(f'[{speaker}]')
+        current_speaker = speaker
+    text_lines.append(f'  {line}')
+
+with open('/audio/$INPUT_BASE.txt', 'w') as f:
+    f.write('\n'.join(text_lines).strip() + '\n')
+
+print(f'\nSaved to $INPUT_BASE.txt')
+"

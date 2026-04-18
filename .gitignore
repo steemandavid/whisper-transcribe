@@ -1,0 +1,6 @@
+# Large files - download manually
+model.bin
+large-v3-support/
+
+# OS
+.DS_Store
