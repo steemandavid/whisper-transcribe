@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Whisper transcription script with speaker diarization
-# Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE]
-#   audio_file  - path to audio/video file (m4a, mp3, wav, mp4, etc.)
-#   --model     - tiny, base, small, medium, large-v3 (default: medium)
-#   --language  - en, nl, fr, de, auto (default: auto-detect)
-#   --prompt    - path to a text file with vocabulary/context hints for Whisper
+# Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE] [--auto-prompt]
+#   audio_file   - path to audio/video file (m4a, mp3, wav, mp4, etc.)
+#   --model      - tiny, base, small, medium, large-v3 (default: medium)
+#   --language   - en, nl, fr, de, auto (default: auto-detect)
+#   --prompt     - path to a text file with vocabulary/context hints for Whisper
+#   --auto-prompt - auto-generate vocabulary prompt via Ollama (quick scan + keyword extraction)
+#   --ollama-model - Ollama model for keyword extraction (default: qwen3.6:35b)
 #
 # Credentials (read at runtime, never baked into the image):
 #   ~/.config/whisper/hf-token  - HuggingFace token for diarization + faster downloads
@@ -17,6 +19,8 @@ MODEL="medium"
 LANGUAGE=""
 INPUT_FILE=""
 PROMPT_FILE=""
+AUTO_PROMPT=false
+OLLAMA_MODEL="qwen3.6:35b"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -26,6 +30,10 @@ while [[ $# -gt 0 ]]; do
             LANGUAGE="$2"; shift 2 ;;
         --prompt|-p)
             PROMPT_FILE="$2"; shift 2 ;;
+        --auto-prompt|-a)
+            AUTO_PROMPT=true; shift ;;
+        --ollama-model|-o)
+            OLLAMA_MODEL="$2"; shift 2 ;;
         -h|--help)
             head -8 "$0"; exit 0 ;;
         -*)
@@ -36,7 +44,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$INPUT_FILE" ]; then
-    echo "Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE]"
+    echo "Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE] [--auto-prompt]"
+    exit 1
+fi
+
+if $AUTO_PROMPT && [ -n "$PROMPT_FILE" ]; then
+    echo "Error: --auto-prompt and --prompt are mutually exclusive"
     exit 1
 fi
 
@@ -87,6 +100,123 @@ if ! docker image inspect "$IMAGE" &>/dev/null; then
     docker build -t "$IMAGE" "$SCRIPT_DIR"
 fi
 
+# --- Auto-prompt: Quick scan + Ollama keyword extraction ---
+AUTO_PROMPT_TEXT=""
+if $AUTO_PROMPT; then
+    # Language flag for quick scan
+    QS_LANG_FLAG=""
+    if [ -n "$LANGUAGE" ] && [ "$LANGUAGE" != "auto" ]; then
+        QS_LANG_FLAG="'$LANGUAGE'"
+    else
+        QS_LANG_FLAG="None"
+    fi
+
+    echo "=== Auto-prompt: Step 1 — Quick scan (base model) ==="
+    ROUGH_FILE=$(mktemp)
+    docker run --rm --gpus all \
+        -v "$INPUT_DIR:/audio" \
+        "$IMAGE" \
+    "
+import whisperx, sys
+audio = whisperx.load_audio('/audio/$INPUT_BASE.$INPUT_EXT')
+sys.stderr.write('Scanning with base model...\n')
+model = whisperx.load_model('base', device='cuda', compute_type='float16', language=$QS_LANG_FLAG)
+result = model.transcribe(audio, batch_size=8, language=$QS_LANG_FLAG)
+text = ' '.join(s['text'].strip() for s in result['segments'] if s['text'].strip())
+sys.stderr.write(f'Detected: {result[\"language\"]} ({len(result[\"segments\"])} segments)\n')
+print(text)
+" > "$ROUGH_FILE"
+
+    ROUGH_TEXT="$(cat "$ROUGH_FILE")"
+    rm -f "$ROUGH_FILE"
+
+    if [ -z "$ROUGH_TEXT" ]; then
+        echo "Warning: Quick scan produced no output. Falling back to no prompt."
+        AUTO_PROMPT=false
+    else
+        echo "Quick scan done ($(echo "$ROUGH_TEXT" | wc -w) words extracted)"
+        echo ""
+
+        # Step 2: Keyword extraction via Ollama
+        echo "=== Auto-prompt: Step 2 — Keyword extraction ($OLLAMA_MODEL) ==="
+
+        # Start Ollama if not running
+        OLLAMA_STARTED_FOR_PROMPT=false
+        if ! systemctl is-active --quiet ollama 2>/dev/null; then
+            echo "Starting Ollama for keyword extraction..."
+            sudo systemctl start ollama
+            sleep 3
+            OLLAMA_STARTED_FOR_PROMPT=true
+        fi
+
+        # Check if the Ollama model is available
+        if ! ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
+            echo "Warning: Ollama model '$OLLAMA_MODEL' not found. Available models:"
+            ollama list 2>/dev/null || echo "  (none — is Ollama running?)"
+            echo "Falling back to no prompt."
+            AUTO_PROMPT=false
+            if $OLLAMA_STARTED_FOR_PROMPT; then
+                sudo systemctl stop ollama
+            fi
+        else
+            # Call Ollama to extract keywords — write prompt to temp file to avoid quoting issues
+            OLLAMA_PROMPT_FILE=$(mktemp)
+            cat > "$OLLAMA_PROMPT_FILE" <<'OLLAMA_HEADER'
+You are analyzing a rough speech-to-text transcript. The transcript may contain
+errors from the speech recognition system. Your task is to identify key terms
+that would help improve recognition accuracy.
+
+Extract and return:
+1. The language and dialect (e.g., "Dutch (Flemish)")
+2. The domain or topic of the conversation
+3. All proper nouns: names of people, places, organizations
+4. Domain-specific terminology and jargon
+5. Any words that appear to be misspelled or misrecognized
+
+Return ONLY a comma-separated list of these terms, as a single line.
+No explanations, no formatting, just the terms.
+
+Transcript:
+---
+OLLAMA_HEADER
+            echo "$ROUGH_TEXT" >> "$OLLAMA_PROMPT_FILE"
+            echo "---" >> "$OLLAMA_PROMPT_FILE"
+
+            AUTO_PROMPT_TEXT="$(ollama run "$OLLAMA_MODEL" < "$OLLAMA_PROMPT_FILE" 2>/dev/null)"
+            rm -f "$OLLAMA_PROMPT_FILE"
+
+            if $OLLAMA_STARTED_FOR_PROMPT; then
+                echo "Stopping Ollama to free GPU memory..."
+                sudo systemctl stop ollama
+                sleep 2
+            fi
+
+            if [ -z "$AUTO_PROMPT_TEXT" ]; then
+                echo "Warning: Ollama returned empty result. Falling back to no prompt."
+                AUTO_PROMPT=false
+            else
+                echo "Generated prompt ($(( ${#AUTO_PROMPT_TEXT} )) chars):"
+                echo "  $AUTO_PROMPT_TEXT"
+                echo ""
+
+                # Write generated prompt to a file for safe Python reading
+                PROMPT_TEMP_FILE="$INPUT_DIR/.whisper_auto_prompt_$$.txt"
+                echo "$AUTO_PROMPT_TEXT" > "$PROMPT_TEMP_FILE"
+
+                # Mount the prompt file's parent (INPUT_DIR is already /audio)
+                # Override PROMPT_PYTHON to read from the mounted file
+                PROMPT_PYTHON="
+with open('/audio/.whisper_auto_prompt_$$.txt', 'r') as f:
+    initial_prompt = f.read().strip()
+print(f'Using auto-generated prompt ({len(initial_prompt)} chars)')
+"
+            fi
+        fi
+    fi
+fi
+
+# --- Main transcription pipeline ---
+
 # Stop Ollama to free VRAM
 OLLAMA_WAS_ACTIVE=false
 if systemctl is-active --quiet ollama 2>/dev/null; then
@@ -102,6 +232,8 @@ cleanup() {
         echo "Restarting Ollama..."
         sudo systemctl start ollama
     fi
+    # Clean up auto-prompt temp file
+    rm -f "$INPUT_DIR/.whisper_auto_prompt_$$.txt"
 }
 trap cleanup EXIT
 
@@ -113,10 +245,14 @@ else
     LANG_FLAG="None"
 fi
 
-echo "Transcribing: $INPUT_BASE"
+echo "=== Transcription: $INPUT_BASE ==="
 echo "Model: $MODEL"
 echo "Output: $INPUT_DIR/$INPUT_BASE.txt"
-[ -n "$PROMPT_FILE" ] && echo "Prompt: $(basename "$PROMPT_FILE")"
+if $AUTO_PROMPT; then
+    echo "Prompt: auto-generated"
+elif [ -n "$PROMPT_FILE" ]; then
+    echo "Prompt: $(basename "$PROMPT_FILE")"
+fi
 
 # Create persistent volume for HuggingFace model cache (survives container restarts)
 docker volume create whisper-hf-cache &>/dev/null
