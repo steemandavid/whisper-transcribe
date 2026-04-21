@@ -60,7 +60,7 @@ NVIDIA GPU (CUDA, ~8 GB peak VRAM)
 +-- hf-token              HuggingFace API token (read-only mount into container)
 
 ~/Documents/transcribe nl/
-+-- prompt-gemeentediensten.txt   Example vocabulary prompt file
++-- prompt-medisch.txt            Example vocabulary prompt file
 ```
 
 ### Docker Resources
@@ -126,12 +126,12 @@ The transcript is written to a `.txt` file alongside the audio file:
 
 ```
 [SPEAKER_00]
-  Goedemorgen, ik ben David Steeman.
-  Ik heb een afspraak om 9 uur.
+  Goedemorgen, ik heb een afspraak om 9 uur.
+  Ik wilde het projectoverzicht bespreken.
 
 [SPEAKER_01]
   Ja, kom maar binnen.
-  Wat kan ik voor u doen?
+  Waar kan ik u mee helpen?
 ```
 
 With `--summary`, a structured summary is appended:
@@ -140,15 +140,16 @@ With `--summary`, a structured summary is appended:
 ---
 
 ## Samenvatting
-David Steeman kwam voor een afspraak om negen uur en besprak de situatie...
+Het team besprak de voortgang van het bouwproject en de
+leveringsproblemen bij de hoofdaannemer...
 
 ## Beslissingen
-- Het is duidelijk dat recreatiegronden gewestplanbestemming zijn...
-- Wegen en waterlopen heeft het dossier over de onteigening...
+- De fundering wordt volgende week afgerond conform planning...
+- Er wordt overgestapt op een alternatieve leverancier voor staal...
 
 ## Actiepunten
-- [ ] Contact opnemen met Wegen en Waterlopen over de specifieke details...
-- [ ] Afspraak maken met Kadaster in Aalst...
+- [ ] Offerte aanvragen bij de nieuwe leverancier voor staalprofelen...
+- [ ] Planning update delen met de opdrachtgever uiterlijk vrijdag...
 ```
 
 ## CLI Reference
@@ -311,17 +312,14 @@ Both flags can be used together. The auto-prompt pipeline runs first to produce 
 
 A vocabulary prompt file is a plain text file containing domain-specific terms that improve Whisper's recognition accuracy. It is passed via Whisper's `initial_prompt` parameter, which primes the model before transcription begins.
 
-### Example (Flemish municipal context)
+### Example (medical consultation context)
 
 ```
-Dit is een gesprek op een Vlaamse gemeentelijke dienst. De gesprekken
-gaan over mobiliteit, stedenbouw, onteigening, verkaveling,
-omgevingsvergunning, gewestplan, ruimtelijk uitvoeringsplan,
-bestemmingsplan, perceel, cadaster, rooilijn, schepen, college van
-burgemeester en schepenen, Mespelare, Oudegem, Gijzegem, Aalst,
-Dendermonde, de Mespel, mobiliteitsdienst, stedenbouwdienst,
-Wegen en Waterlopen, collectorenwerken, riolering, fietsstraat,
-tractorsluis, Aquafin, Gemeentewerken.
+Dit is een medisch consult. De gesprekken gaan over hypertensie,
+diabetes mellitus, cholesterol, bloeddruk, receptuur, huisarts,
+specialist, verwijzing, bloedonderzoek, recept, dosering,
+bijwerkingen, chronische aandoening, preventief onderzoek,
+vaccinatie, longfunctie, physiotherapie, orthopedie, revalidatie.
 ```
 
 ### Guidelines for writing prompt files
