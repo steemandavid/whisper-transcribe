@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Whisper transcription script with speaker diarization
-# Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE] [--auto-prompt]
+# Usage: transcribe <audio_file> [--quality QUALITY] [--model MODEL] [--language LANG] [--prompt FILE] [--auto-prompt] [--summary]
 #   audio_file   - path to audio/video file (m4a, mp3, wav, mp4, etc.)
-#   --model      - tiny, base, small, medium, large-v3 (default: medium)
+#   --quality    - fast, medium, good, perfect — preset for scan model, final model and quality params
+#   --model      - tiny, base, small, medium, large-v3 (overrides quality preset's final model)
 #   --language   - en, nl, fr, de, auto (default: auto-detect)
 #   --prompt     - path to a text file with vocabulary/context hints for Whisper
 #   --auto-prompt - auto-generate vocabulary prompt via Ollama (quick scan + keyword extraction)
-#   --ollama-model - Ollama model for keyword extraction (default: qwen3.6:35b)
+#   --summary    - append LLM-generated summary, decisions and action items to the transcript
+#   --ollama-model - Ollama model for keyword extraction (default: auto-select best available)
 #
 # Credentials (read at runtime, never baked into the image):
 #   ~/.config/whisper/hf-token  - HuggingFace token for diarization + faster downloads
@@ -20,20 +22,27 @@ LANGUAGE=""
 INPUT_FILE=""
 PROMPT_FILE=""
 AUTO_PROMPT=false
-OLLAMA_MODEL="qwen3.6:35b"
+SUMMARY=false
+OLLAMA_MODEL=""
+QUALITY=""
+MODEL_EXPLICIT=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model|-m)
-            MODEL="$2"; shift 2 ;;
+            MODEL="$2"; MODEL_EXPLICIT=true; shift 2 ;;
         --language|-l)
             LANGUAGE="$2"; shift 2 ;;
         --prompt|-p)
             PROMPT_FILE="$2"; shift 2 ;;
         --auto-prompt|-a)
             AUTO_PROMPT=true; shift ;;
+        --summary|-s)
+            SUMMARY=true; shift ;;
         --ollama-model|-o)
             OLLAMA_MODEL="$2"; shift 2 ;;
+        --quality|-Q)
+            QUALITY="$2"; shift 2 ;;
         -h|--help)
             head -8 "$0"; exit 0 ;;
         -*)
@@ -44,7 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$INPUT_FILE" ]; then
-    echo "Usage: transcribe <audio_file> [--model MODEL] [--language LANG] [--prompt FILE] [--auto-prompt]"
+    echo "Usage: transcribe <audio_file> [--quality QUALITY] [--model MODEL] [--language LANG] [--prompt FILE] [--auto-prompt] [--summary]"
     exit 1
 fi
 
@@ -52,6 +61,67 @@ if $AUTO_PROMPT && [ -n "$PROMPT_FILE" ]; then
     echo "Error: --auto-prompt and --prompt are mutually exclusive"
     exit 1
 fi
+
+# --- Quality presets ---
+# Each preset configures: scan model (auto-prompt quick scans), final model, and quality parameters.
+# --model overrides the final model from the preset.
+if [ -n "$QUALITY" ]; then
+    case "$QUALITY" in
+        fast)
+            SCAN_MODEL="base"
+            BEAM_SIZE=2
+            BEST_OF=2
+            BATCH_SIZE=16
+            QUALITY_MODEL="small"
+            ;;
+        medium)
+            SCAN_MODEL="base"
+            BEAM_SIZE=5
+            BEST_OF=5
+            BATCH_SIZE=12
+            QUALITY_MODEL="medium"
+            ;;
+        good)
+            SCAN_MODEL="medium"
+            BEAM_SIZE=10
+            BEST_OF=10
+            BATCH_SIZE=8
+            QUALITY_MODEL="large-v3"
+            ;;
+        perfect)
+            SCAN_MODEL="large-v3"
+            BEAM_SIZE=10
+            BEST_OF=10
+            BATCH_SIZE=8
+            QUALITY_MODEL="large-v3"
+            ;;
+        *)
+            echo "Error: Unknown quality level '$QUALITY' (choose: fast, medium, good, perfect)"
+            exit 1
+            ;;
+    esac
+    # --model overrides the quality preset's final model
+    if $MODEL_EXPLICIT; then
+        QUALITY_MODEL="$MODEL"
+    fi
+else
+    # No quality preset — use --model (default: medium) with max quality params
+    SCAN_MODEL="medium"
+    QUALITY_MODEL="$MODEL"
+    BEAM_SIZE=10
+    BEST_OF=10
+    BATCH_SIZE=8
+fi
+
+# Pre-loaded model path for large-v3 scans
+if [ "$SCAN_MODEL" = "large-v3" ]; then
+    SCAN_MODEL_PATH="/opt/whisper-models/large-v3"
+else
+    SCAN_MODEL_PATH="$SCAN_MODEL"
+fi
+
+# Apply the resolved model
+MODEL="$QUALITY_MODEL"
 
 INPUT_BASE="$(basename "${INPUT_FILE%.*}")"
 INPUT_EXT="${INPUT_FILE##*.}"
@@ -100,10 +170,104 @@ if ! docker image inspect "$IMAGE" &>/dev/null; then
     docker build -t "$IMAGE" "$SCRIPT_DIR"
 fi
 
-# --- Auto-prompt: Quick scan + Ollama keyword extraction ---
+# Auto-select the best available Ollama model for keyword extraction.
+# Prefers newer and larger general-purpose models; excludes embedding models;
+# penalizes coder-specific models; applies generation bonus (qwen3 > qwen2.5).
+select_ollama_model() {
+    ollama list 2>/dev/null | awk '
+    NR == 1 { next }
+    tolower($1) ~ /embed/ { next }
+    {
+        if ($4 == "GB") size = $3 * 1024;
+        else if ($4 == "MB") size = $3;
+        else size = 0;
+        # Penalize coder-specific models
+        if (tolower($1) ~ /coder/) size *= 0.7;
+        # Penalize thinking models (qwen3) — cannot reliably disable thinking mode
+        if (tolower($1) ~ /^qwen3/) size *= 0.5;
+        # Bonus for instruct variants (better at following extraction prompts)
+        if (tolower($1) ~ /instruct/) size *= 1.3;
+        # Generation bonus: prefer newer model families
+        ver = 1.0;
+        if (match(tolower($1), /[0-9]+(\.[0-9]+)?/)) {
+            ver = substr(tolower($1), RSTART, RLENGTH) + 0;
+        }
+        gen_bonus = 1.0 + ver * 0.2;
+        effective = size * gen_bonus;
+        if (effective > best) { best = effective; name = $1 }
+    }
+    END { if (name != "") print name }'
+}
+
+# Track original Ollama state for cleanup
+OLLAMA_WAS_ACTIVE=false
+if systemctl is-active --quiet ollama 2>/dev/null; then
+    OLLAMA_WAS_ACTIVE=true
+fi
+
+# Cleanup: restart Ollama if it was running before the script, remove temp files
+cleanup() {
+    if $OLLAMA_WAS_ACTIVE; then
+        echo "Restarting Ollama..."
+        sudo systemctl start ollama
+    fi
+    rm -f "$INPUT_DIR/.whisper_auto_prompt_$$.txt"
+    rm -f "$INPUT_DIR/.whisper_prompt_v1_$$.txt"
+}
+trap cleanup EXIT
+
+# Helper functions for Ollama lifecycle
+ollama_ensure_running() {
+    if ! systemctl is-active --quiet ollama 2>/dev/null; then
+        echo "Starting Ollama..."
+        sudo systemctl start ollama
+        sleep 3
+    fi
+}
+ollama_stop_for_gpu() {
+    if systemctl is-active --quiet ollama 2>/dev/null; then
+        echo "Stopping Ollama to free GPU memory..."
+        sudo systemctl stop ollama
+        sleep 2
+    fi
+}
+
+# Run an Ollama prompt via the /api/chat endpoint.
+# Uses /no_think system message to suppress qwen3 thinking mode,
+# and extracts only the .message.content field for the clean response.
+ollama_extract() {
+    local prompt_file="$1"
+    local preserve_newlines="${2:-false}"
+    local json_file
+    json_file=$(mktemp)
+    jq -nc --arg model "$OLLAMA_MODEL" --rawfile prompt "$prompt_file" \
+        '{model: $model, messages: [{role: "system", content: "/no_think"}, {role: "user", content: $prompt}], stream: false, think: false, options: {num_predict: 4096}}' > "$json_file" 2>/dev/null
+    local raw_response
+    raw_response=$(curl -s --max-time 300 http://localhost:11434/api/chat -d @"$json_file" 2>/dev/null)
+    rm -f "$json_file"
+    if [ -z "$raw_response" ]; then
+        echo "Warning: Ollama API returned empty response" >&2
+        echo ""
+        return
+    fi
+    local result
+    if $preserve_newlines; then
+        result=$(echo "$raw_response" | jq -r '.message.content // empty' 2>/dev/null \
+            | sed $'s/\033\[[0-9;]*[a-zA-Z]//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    else
+        result=$(echo "$raw_response" | jq -r '.message.content // empty' 2>/dev/null \
+            | sed $'s/\033\[[0-9;]*[a-zA-Z]//g' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+    fi
+    if [ -z "$result" ]; then
+        echo "Warning: Ollama .message.content field is empty (raw: $(echo "$raw_response" | head -c 200))" >&2
+    fi
+    echo "$result"
+}
+
+# --- Auto-prompt: iterative scan + Ollama keyword extraction ---
 AUTO_PROMPT_TEXT=""
 if $AUTO_PROMPT; then
-    # Language flag for quick scan
+    # Language flag for scans
     QS_LANG_FLAG=""
     if [ -n "$LANGUAGE" ] && [ "$LANGUAGE" != "auto" ]; then
         QS_LANG_FLAG="'$LANGUAGE'"
@@ -111,69 +275,70 @@ if $AUTO_PROMPT; then
         QS_LANG_FLAG="None"
     fi
 
-    echo "=== Auto-prompt: Step 1 — Quick scan (base model) ==="
-    ROUGH_FILE=$(mktemp)
-    docker run --rm --gpus all \
-        -v "$INPUT_DIR:/audio" \
-        "$IMAGE" \
-    "
-import whisperx, sys
+    # Resolve Ollama model once, before any scans
+    ollama_ensure_running
+    if [ -n "$OLLAMA_MODEL" ] && ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
+        echo "Using Ollama model: $OLLAMA_MODEL"
+    else
+        if [ -n "$OLLAMA_MODEL" ]; then
+            echo "Warning: Ollama model '$OLLAMA_MODEL' not found."
+        fi
+        echo "Auto-selecting best available model..."
+        OLLAMA_MODEL="$(select_ollama_model)"
+        if [ -z "$OLLAMA_MODEL" ]; then
+            echo "Warning: No suitable Ollama model found. Available models:"
+            ollama list 2>/dev/null || echo "  (none — is Ollama running?)"
+            echo "Falling back to no prompt."
+            AUTO_PROMPT=false
+        else
+            echo "Auto-selected: $OLLAMA_MODEL"
+        fi
+    fi
+    ollama_stop_for_gpu
+
+    if $AUTO_PROMPT; then
+        # === Step 1: Quick scan (no prompt) → rough text ===
+        echo "=== Auto-prompt: Step 1 — Quick scan ($SCAN_MODEL model) ==="
+        ROUGH_FILE=$(mktemp)
+        docker run --rm --gpus all \
+            -v "$INPUT_DIR:/audio" \
+            -v "whisper-hf-cache:/root/.cache/huggingface" \
+            "$IMAGE" \
+        "
+import whisperx, sys, logging
+logging.getLogger('whisperx').setLevel(logging.WARNING)
+logging.getLogger('pyannote').setLevel(logging.WARNING)
 audio = whisperx.load_audio('/audio/$INPUT_BASE.$INPUT_EXT')
-sys.stderr.write('Scanning with base model...\n')
-model = whisperx.load_model('base', device='cuda', compute_type='float16', language=$QS_LANG_FLAG)
+sys.stderr.write('Scanning with $SCAN_MODEL model...\n')
+model = whisperx.load_model('$SCAN_MODEL_PATH', device='cuda', compute_type='float16', language=$QS_LANG_FLAG)
 result = model.transcribe(audio, batch_size=8, language=$QS_LANG_FLAG)
 text = ' '.join(s['text'].strip() for s in result['segments'] if s['text'].strip())
 sys.stderr.write(f'Detected: {result[\"language\"]} ({len(result[\"segments\"])} segments)\n')
 print(text)
 " > "$ROUGH_FILE"
 
-    ROUGH_TEXT="$(cat "$ROUGH_FILE")"
-    rm -f "$ROUGH_FILE"
+        ROUGH_TEXT="$(grep -v '^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' "$ROUGH_FILE" | grep -v '^$')"
+        rm -f "$ROUGH_FILE"
 
-    if [ -z "$ROUGH_TEXT" ]; then
-        echo "Warning: Quick scan produced no output. Falling back to no prompt."
-        AUTO_PROMPT=false
-    else
-        echo "Quick scan done ($(echo "$ROUGH_TEXT" | wc -w) words extracted)"
-        echo ""
-
-        # Step 2: Keyword extraction via Ollama
-        echo "=== Auto-prompt: Step 2 — Keyword extraction ($OLLAMA_MODEL) ==="
-
-        # Start Ollama if not running
-        OLLAMA_STARTED_FOR_PROMPT=false
-        if ! systemctl is-active --quiet ollama 2>/dev/null; then
-            echo "Starting Ollama for keyword extraction..."
-            sudo systemctl start ollama
-            sleep 3
-            OLLAMA_STARTED_FOR_PROMPT=true
-        fi
-
-        # Check if the Ollama model is available
-        if ! ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
-            echo "Warning: Ollama model '$OLLAMA_MODEL' not found. Available models:"
-            ollama list 2>/dev/null || echo "  (none — is Ollama running?)"
-            echo "Falling back to no prompt."
+        if [ -z "$ROUGH_TEXT" ]; then
+            echo "Warning: Quick scan produced no output. Falling back to no prompt."
             AUTO_PROMPT=false
-            if $OLLAMA_STARTED_FOR_PROMPT; then
-                sudo systemctl stop ollama
-            fi
         else
-            # Call Ollama to extract keywords — write prompt to temp file to avoid quoting issues
+            echo "Quick scan done ($(echo "$ROUGH_TEXT" | wc -w) words extracted)"
+            echo ""
+
+            # === Step 2: LLM keyword extraction → prompt v1 ===
+            echo "=== Auto-prompt: Step 2 — Keyword extraction ==="
+            ollama_ensure_running
+
             OLLAMA_PROMPT_FILE=$(mktemp)
             cat > "$OLLAMA_PROMPT_FILE" <<'OLLAMA_HEADER'
-You are analyzing a rough speech-to-text transcript. The transcript may contain
-errors from the speech recognition system. Your task is to identify key terms
-that would help improve recognition accuracy.
+Extract vocabulary terms from this speech-to-text transcript that would improve
+recognition accuracy. Focus on: proper nouns (people, places, organizations),
+domain-specific terminology, and technical jargon. Correct any obvious
+misrecognitions to their likely intended form.
 
-Extract and return:
-1. The language and dialect (e.g., "Dutch (Flemish)")
-2. The domain or topic of the conversation
-3. All proper nouns: names of people, places, organizations
-4. Domain-specific terminology and jargon
-5. Any words that appear to be misspelled or misrecognized
-
-Return ONLY a comma-separated list of these terms, as a single line.
+Return ONLY a comma-separated list of terms (max 50), as a single line.
 No explanations, no formatting, just the terms.
 
 Transcript:
@@ -182,60 +347,109 @@ OLLAMA_HEADER
             echo "$ROUGH_TEXT" >> "$OLLAMA_PROMPT_FILE"
             echo "---" >> "$OLLAMA_PROMPT_FILE"
 
-            AUTO_PROMPT_TEXT="$(ollama run "$OLLAMA_MODEL" < "$OLLAMA_PROMPT_FILE" 2>/dev/null)"
+            AUTO_PROMPT_TEXT="$(ollama_extract "$OLLAMA_PROMPT_FILE")"
             rm -f "$OLLAMA_PROMPT_FILE"
-
-            if $OLLAMA_STARTED_FOR_PROMPT; then
-                echo "Stopping Ollama to free GPU memory..."
-                sudo systemctl stop ollama
-                sleep 2
-            fi
+            ollama_stop_for_gpu
 
             if [ -z "$AUTO_PROMPT_TEXT" ]; then
                 echo "Warning: Ollama returned empty result. Falling back to no prompt."
                 AUTO_PROMPT=false
             else
-                echo "Generated prompt ($(( ${#AUTO_PROMPT_TEXT} )) chars):"
+                echo "Generated prompt v1 ($(( ${#AUTO_PROMPT_TEXT} )) chars):"
                 echo "  $AUTO_PROMPT_TEXT"
                 echo ""
 
-                # Write generated prompt to a file for safe Python reading
-                PROMPT_TEMP_FILE="$INPUT_DIR/.whisper_auto_prompt_$$.txt"
-                echo "$AUTO_PROMPT_TEXT" > "$PROMPT_TEMP_FILE"
+                # === Step 3: Scan with prompt v1 → cleaner text ===
+                echo "=== Auto-prompt: Step 3 — Refined scan ($SCAN_MODEL model + prompt v1) ==="
 
-                # Mount the prompt file's parent (INPUT_DIR is already /audio)
-                # Override PROMPT_PYTHON to read from the mounted file
-                PROMPT_PYTHON="
+                # Write prompt v1 to temp file for the scan container
+                PROMPT_V1_FILE="$INPUT_DIR/.whisper_prompt_v1_$$.txt"
+                echo "$AUTO_PROMPT_TEXT" > "$PROMPT_V1_FILE"
+
+                REFINED_FILE=$(mktemp)
+                docker run --rm --gpus all \
+                    -v "$INPUT_DIR:/audio" \
+                    -v "whisper-hf-cache:/root/.cache/huggingface" \
+                    "$IMAGE" \
+                "
+import whisperx, sys, logging
+logging.getLogger('whisperx').setLevel(logging.WARNING)
+logging.getLogger('pyannote').setLevel(logging.WARNING)
+audio = whisperx.load_audio('/audio/$INPUT_BASE.$INPUT_EXT')
+sys.stderr.write('Scanning with $SCAN_MODEL model + prompt...\n')
+with open('/audio/.whisper_prompt_v1_$$.txt', 'r') as f:
+    prompt_text = f.read().strip()
+sys.stderr.write(f'Using prompt ({len(prompt_text)} chars)\n')
+model = whisperx.load_model('$SCAN_MODEL_PATH', device='cuda', compute_type='float16', language=$QS_LANG_FLAG,
+    asr_options={'initial_prompt': prompt_text})
+result = model.transcribe(audio, batch_size=8, language=$QS_LANG_FLAG)
+text = ' '.join(s['text'].strip() for s in result['segments'] if s['text'].strip())
+sys.stderr.write(f'Detected: {result[\"language\"]} ({len(result[\"segments\"])} segments)\n')
+print(text)
+" > "$REFINED_FILE"
+                rm -f "$PROMPT_V1_FILE"
+
+                REFINED_TEXT="$(grep -v '^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' "$REFINED_FILE" | grep -v '^$')"
+                rm -f "$REFINED_FILE"
+
+                if [ -z "$REFINED_TEXT" ]; then
+                    echo "Warning: Refined scan produced no output. Using prompt v1."
+                else
+                    echo "Refined scan done ($(echo "$REFINED_TEXT" | wc -w) words extracted)"
+                    echo ""
+
+                    # === Step 4: LLM keyword refinement → prompt v2 ===
+                    echo "=== Auto-prompt: Step 4 — Keyword refinement ==="
+                    ollama_ensure_running
+
+                    OLLAMA_REFINE_FILE=$(mktemp)
+                    cat > "$OLLAMA_REFINE_FILE" <<'OLLAMA_REFINE'
+Refine the vocabulary for speech-to-text transcription. Based on this cleaner
+transcript: keep correct proper nouns and domain terms, remove transcription
+errors, add missed important terms. No common words or filler.
+
+Return ONLY a comma-separated list of terms (max 50), as a single line.
+No explanations, no formatting, just the terms.
+
+Transcript:
+---
+OLLAMA_REFINE
+                    echo "$REFINED_TEXT" >> "$OLLAMA_REFINE_FILE"
+                    echo "---" >> "$OLLAMA_REFINE_FILE"
+
+                    REFINED_PROMPT="$(ollama_extract "$OLLAMA_REFINE_FILE")"
+                    rm -f "$OLLAMA_REFINE_FILE"
+                    ollama_stop_for_gpu
+
+                    if [ -n "$REFINED_PROMPT" ]; then
+                        echo "Refined prompt v2 ($(( ${#REFINED_PROMPT} )) chars):"
+                        echo "  $REFINED_PROMPT"
+                        echo ""
+                        AUTO_PROMPT_TEXT="$REFINED_PROMPT"
+                    else
+                        echo "Warning: LLM refinement returned empty. Using prompt v1."
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # Write final prompt to file for the main transcription pass
+    if $AUTO_PROMPT && [ -n "$AUTO_PROMPT_TEXT" ]; then
+        PROMPT_TEMP_FILE="$INPUT_DIR/.whisper_auto_prompt_$$.txt"
+        echo "$AUTO_PROMPT_TEXT" > "$PROMPT_TEMP_FILE"
+        PROMPT_PYTHON="
 with open('/audio/.whisper_auto_prompt_$$.txt', 'r') as f:
     initial_prompt = f.read().strip()
 print(f'Using auto-generated prompt ({len(initial_prompt)} chars)')
 "
-            fi
-        fi
     fi
 fi
 
 # --- Main transcription pipeline ---
 
-# Stop Ollama to free VRAM
-OLLAMA_WAS_ACTIVE=false
-if systemctl is-active --quiet ollama 2>/dev/null; then
-    OLLAMA_WAS_ACTIVE=true
-    echo "Stopping Ollama to free GPU memory..."
-    sudo systemctl stop ollama
-    sleep 2
-fi
-
-# Ensure Ollama restarts on exit (even on error)
-cleanup() {
-    if $OLLAMA_WAS_ACTIVE; then
-        echo "Restarting Ollama..."
-        sudo systemctl start ollama
-    fi
-    # Clean up auto-prompt temp file
-    rm -f "$INPUT_DIR/.whisper_auto_prompt_$$.txt"
-}
-trap cleanup EXIT
+# Ensure Ollama is stopped for GPU transcription (should already be, but verify)
+ollama_stop_for_gpu
 
 # Language flag
 LANG_FLAG=""
@@ -247,6 +461,7 @@ fi
 
 echo "=== Transcription: $INPUT_BASE ==="
 echo "Model: $MODEL"
+echo "Quality: ${QUALITY:-custom} (beam=$BEAM_SIZE, best_of=$BEST_OF, batch=$BATCH_SIZE)"
 echo "Output: $INPUT_DIR/$INPUT_BASE.txt"
 if $AUTO_PROMPT; then
     echo "Prompt: auto-generated"
@@ -281,8 +496,8 @@ $PROMPT_PYTHON
 print(f'Loading model: $MODEL ...')
 model_path = '/opt/whisper-models/large-v3' if '$MODEL' == 'large-v3' else '$MODEL'
 asr_opts = {
-    'beam_size': 10,
-    'best_of': 10,
+    'beam_size': $BEAM_SIZE,
+    'best_of': $BEST_OF,
     'temperatures': [0],
     'condition_on_previous_text': True,
     'compression_ratio_threshold': 2.4,
@@ -297,11 +512,11 @@ print('Model loaded.')
 print(f'Loading audio: {audio_file}')
 audio = whisperx.load_audio(audio_file)
 
-print('Transcribing (max quality mode)...')
+print('Transcribing (beam_size=$BEAM_SIZE, best_of=$BEST_OF, batch=$BATCH_SIZE)...')
 start = time.time()
 result = model.transcribe(
     audio,
-    batch_size=8,
+    batch_size=$BATCH_SIZE,
     language=language,
 )
 elapsed = time.time() - start
@@ -372,6 +587,87 @@ for seg in result['segments']:
 
 with open('/audio/$INPUT_BASE.txt', 'w') as f:
     f.write('\n'.join(text_lines).strip() + '\n')
+os.chmod('/audio/$INPUT_BASE.txt', 0o666)
 
 print(f'\nSaved to $INPUT_BASE.txt')
 "
+
+# --- Summary via Ollama ---
+if $SUMMARY; then
+    OUTPUT_FILE="$INPUT_DIR/$INPUT_BASE.txt"
+    if [ ! -f "$OUTPUT_FILE" ]; then
+        echo "Warning: Transcript file not found, skipping summary."
+    else
+        echo ""
+        echo "=== Summary ==="
+        echo "Generating summary, decisions and action items..."
+
+        # Resolve Ollama model (reuse auto-prompt selection logic)
+        ollama_ensure_running
+        if [ -n "$OLLAMA_MODEL" ] && ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
+            echo "Using Ollama model: $OLLAMA_MODEL"
+        else
+            if [ -n "$OLLAMA_MODEL" ]; then
+                echo "Warning: Ollama model '$OLLAMA_MODEL' not found."
+            fi
+            echo "Auto-selecting best available model..."
+            OLLAMA_MODEL="$(select_ollama_model)"
+            if [ -z "$OLLAMA_MODEL" ]; then
+                echo "Warning: No suitable Ollama model found. Skipping summary."
+                ollama_stop_for_gpu
+                OLLAMA_MODEL=""
+            else
+                echo "Auto-selected: $OLLAMA_MODEL"
+            fi
+        fi
+    fi
+
+    if $SUMMARY && [ -n "$OLLAMA_MODEL" ]; then
+        SUMMARY_PROMPT_FILE=$(mktemp)
+        cat > "$SUMMARY_PROMPT_FILE" <<'SUMMARY_PROMPT'
+Analyze this meeting transcript and provide:
+1. A concise summary of the conversation (3-5 sentences)
+2. A list of key decisions or conclusions reached
+3. A list of action items, follow-ups or open questions
+
+Use the same language as the transcript. Be specific — include names, places, numbers mentioned.
+
+Format your response exactly as:
+
+## Samenvatting
+<summary here>
+
+## Beslissingen
+- <decision 1>
+- <decision 2>
+
+## Actiepunten
+- [ ] <action item 1>
+- [ ] <action item 2>
+
+If there are no decisions or action items, write "Geen" (or equivalent in the transcript's language) under that section.
+
+Transcript:
+---
+SUMMARY_PROMPT
+        cat "$OUTPUT_FILE" >> "$SUMMARY_PROMPT_FILE"
+        echo "---" >> "$SUMMARY_PROMPT_FILE"
+
+        SUMMARY_TEXT="$(ollama_extract "$SUMMARY_PROMPT_FILE" true)"
+        rm -f "$SUMMARY_PROMPT_FILE"
+        ollama_stop_for_gpu
+
+        if [ -z "$SUMMARY_TEXT" ]; then
+            echo "Warning: LLM returned empty summary."
+        else
+            # Append summary to the transcript file
+            {
+                echo ""
+                echo "---"
+                echo ""
+                echo "$SUMMARY_TEXT"
+            } >> "$OUTPUT_FILE"
+            echo "Summary appended to $INPUT_BASE.txt"
+        fi
+    fi
+fi
