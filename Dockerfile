@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Pin all dependencies
 RUN pip3 install --no-cache-dir \
-    torch==2.5.1+cu124 \
+    torch==2.5.1 \
     torchaudio==2.5.1 \
     -f https://download.pytorch.org/whl/torch_stable.html || \
     pip3 install --no-cache-dir torch==2.5.1 torchaudio==2.5.1
@@ -27,11 +27,10 @@ RUN pip3 install --no-cache-dir nvidia-cudnn-cu12==9.* && \
     ln -sf /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib/libcudnn*.so* /usr/local/lib/ || true
 
 RUN pip3 install --no-cache-dir \
-    ctranslate2==4.5.0 \
+    ctranslate2==4.4.0 \
     faster-whisper==1.1.1 \
     whisperx==3.4.2 \
     pyannote.audio==3.4.0 \
-    openai==1.54.0 \
     huggingface_hub==0.30.2 \
     soundfile \
     numpy \
@@ -101,7 +100,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Pin runtime deps (no build tools)
 RUN pip3 install --no-cache-dir \
-    torch==2.5.1+cu124 \
+    torch==2.5.1 \
     torchaudio==2.5.1 \
     -f https://download.pytorch.org/whl/torch_stable.html || \
     pip3 install --no-cache-dir torch==2.5.1 torchaudio==2.5.1
@@ -111,11 +110,10 @@ RUN pip3 install --no-cache-dir nvidia-cudnn-cu12==9.* && \
     ln -sf /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib/libcudnn*.so* /usr/local/lib/ || true
 
 RUN pip3 install --no-cache-dir \
-    ctranslate2==4.5.0 \
+    ctranslate2==4.4.0 \
     faster-whisper==1.1.1 \
     whisperx==3.4.2 \
     pyannote.audio==3.4.0 \
-    openai==1.54.0 \
     huggingface_hub==0.30.2 \
     soundfile \
     numpy \
@@ -134,7 +132,7 @@ COPY pipeline/ /opt/pipeline/
 ENV WHISPER_MODEL_DIR=/opt/whisper-models
 
 # Smoke test
-RUN python3 -c "import faster_whisper, whisperx, torch, pyannote.audio, openai; print('imports ok')"
+RUN python3 -c "import faster_whisper, whisperx, torch, pyannote.audio; print('imports ok')"
 
 WORKDIR /audio
 

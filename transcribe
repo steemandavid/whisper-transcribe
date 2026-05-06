@@ -271,12 +271,14 @@ select_ollama_model() {
 
 # Helper: run a pipeline stage in Docker
 # Extra docker args (e.g. -v mounts) can be passed via DOCKER_STAGE_EXTRA array
+
 docker_stage() {
     local stage="$1"; shift
     docker run --rm --gpus all \
         "${DOCKER_ARGS[@]}" \
         "${ZAI_ENV[@]}" \
         "${DOCKER_STAGE_EXTRA[@]}" \
+        -v "$SCRIPT_DIR/pipeline:/opt/pipeline:ro" \
         "$IMAGE" \
         "pipeline.$stage" "$@"
 }

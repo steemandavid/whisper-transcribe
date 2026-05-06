@@ -2,7 +2,7 @@
 
 Two backends:
   - OllamaCorrector: local LLM via Ollama HTTP API
-  - ZaiCorrector: cloud GLM model via Z.ai OpenAI-compatible API with auto-versioning
+  - ZaiCorrector: cloud GLM model via Z.ai Anthropic Messages API with auto-versioning
 
 Applies only high-confidence corrections (>= 0.8) and rejects segments with
 > 35% token churn via a diff guard.
@@ -15,6 +15,8 @@ import os
 import re
 import sys
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Protocol
 
@@ -49,8 +51,8 @@ _GLM_EXCLUDE = {"coder", "embedding", "vision"}
 _CACHE_TTL_S = 86400  # 24 hours
 
 
-def resolve_glm_model(client, *, refresh: bool = False, cache_path: Path = _GLM_CACHE) -> str:
-    """Resolve the latest GLM model id from the Z.ai API, with 24h caching."""
+def resolve_glm_model(api_key: str, *, refresh: bool = False, cache_path: Path = _GLM_CACHE) -> str:
+    """Resolve the latest GLM model id from the Z.ai OpenAI-compatible API, with 24h caching."""
     if not refresh and cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text())
@@ -63,17 +65,21 @@ def resolve_glm_model(client, *, refresh: bool = False, cache_path: Path = _GLM_
             pass
 
     try:
-        models = client.models.list()
+        req = urllib.request.Request(
+            "https://api.z.ai/api/paas/v4/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
         best: tuple[int, int] = (0, 0)
         best_id = _GLM_FALLBACK
-        for m in models:
-            mid = m.id if hasattr(m, "id") else str(m)
+        for m in data.get("data", []):
+            mid = m.get("id", "") if isinstance(m, dict) else str(m)
             if not mid.startswith("glm-"):
                 continue
             lower = mid.lower()
             if any(exc in lower for exc in _GLM_EXCLUDE):
                 continue
-            # Parse glm-X.Y or glm-X
             match = re.match(r"glm-(\d+)(?:\.(\d+))?", mid)
             if not match:
                 continue
@@ -182,54 +188,57 @@ class OllamaCorrector:
         return _parse_corrections(content, segments)
 
 
-# --- Z.ai GLM backend ---
+# --- Z.ai GLM backend (Anthropic Messages API) ---
+
+_ZAI_ANTHROPIC_URL = "https://api.z.ai/api/anthropic/v1/messages"
+
 
 class ZaiCorrector:
     def __init__(self, api_key: str | None = None, model: str | None = None):
-        from openai import OpenAI
         self.api_key = api_key or os.environ.get("ZAI_API_KEY", "")
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.z.ai/api/paas/v4/",
-        )
-        self.model = model or resolve_glm_model(self.client)
+        self.model = model or resolve_glm_model(self.api_key)
         self.last_usage: dict | None = None  # accumulated across batches
 
     def correct(self, segments: list[dict], system_prompt: str, language: str) -> list[dict]:
         batch_text = _format_batch(segments)
         user_prompt = f"Transcript segments to correct:\n{batch_text}"
+        payload = json.dumps({
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": f"{system_prompt}\n\nRespond only in valid JSON array. No markdown fences.",
+            "messages": [{"role": "user", "content": user_prompt}],
+            "temperature": 0.1,
+        }).encode()
 
         def _call():
-            return self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"{system_prompt}\n\nRespond only in valid JSON array. No markdown fences.",
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
-                ],
-                temperature=0.1,
+            req = urllib.request.Request(
+                _ZAI_ANTHROPIC_URL,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                },
             )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                return json.loads(resp.read())
 
         response = _retry(_call)
-        # Track token usage for sidecar output
-        if hasattr(response, 'usage') and response.usage:
-            batch_usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-            }
+        # Track token usage
+        usage = response.get("usage", {})
+        inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        if inp or out:
             if self.last_usage is None:
                 self.last_usage = {"model": self.model, "batches": 0, "total_prompt_tokens": 0, "total_completion_tokens": 0}
             self.last_usage["batches"] += 1
-            self.last_usage["total_prompt_tokens"] += batch_usage["prompt_tokens"]
-            self.last_usage["total_completion_tokens"] += batch_usage["completion_tokens"]
-            print(f"Z.ai ({self.model}): {batch_usage['prompt_tokens']} prompt + {batch_usage['completion_tokens']} completion tokens (batch {self.last_usage['batches']})", file=sys.stderr)
-        content = response.choices[0].message.content or ""
-        return _parse_corrections(content, segments)
+            self.last_usage["total_prompt_tokens"] += inp
+            self.last_usage["total_completion_tokens"] += out
+            print(f"Z.ai ({self.model}): {inp} prompt + {out} completion tokens (batch {self.last_usage['batches']})", file=sys.stderr)
+        # Extract text from Anthropic response format
+        content_blocks = response.get("content", [])
+        text = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text")
+        return _parse_corrections(text, segments)
 
 
 # --- Shared helpers ---
@@ -397,8 +406,8 @@ def run(
     corrector: PostCorrector
     if backend == "zai":
         corrector = ZaiCorrector(api_key=zai_api_key, model=zai_model)
-        if refresh_model and hasattr(corrector, "client"):
-            corrector.model = resolve_glm_model(corrector.client, refresh=True)
+        if refresh_model:
+            corrector.model = resolve_glm_model(corrector.api_key, refresh=True)
     else:
         corrector = OllamaCorrector(model=ollama_model)
 

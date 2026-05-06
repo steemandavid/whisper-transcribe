@@ -18,7 +18,7 @@ Self-hosted, GPU-accelerated speech-to-text with speaker diarization, multi-engi
 - **Auto-prompt** — iterative pipeline that uses a local LLM to extract domain-specific vocabulary
 - **Manual prompts** — pass a vocabulary file for known domains
 - **Summaries** — LLM-generated summary, decisions, and action items appended to the transcript
-- **LLM post-correction** — fix brand names and phonetic mishearings (local Ollama or cloud GLM)
+- **LLM post-correction** — fix brand names and phonetic mishearings (local Ollama or cloud GLM via Z.ai Anthropic-compatible API)
 - **GPU-accelerated** — ~2 minutes for a 42-minute recording on RTX 3090
 - **Privacy-first** — all processing happens locally, no cloud APIs (unless `--cloud-correct`)
 
@@ -65,6 +65,7 @@ audio.m4a
 |  Stage 5: LLM Post-Correction (optional)     |
 |  - Fixes brand names and phonetic errors     |
 |  - Local (Ollama) or cloud (GLM via Z.ai)    |
+|  - Cloud uses Anthropic Messages API         |
 |  Output: cleaned.json                        |
 +---------------------------------------------+
      |
@@ -342,7 +343,7 @@ Ollama and WhisperX share the GPU. The pipeline manages the lifecycle:
 The `--correct` or `--cloud-correct` flags run LLM post-correction on the transcript. The LLM receives the verbatim transcript, glossary, and context, and corrects phonetic mishearings while preserving the original meaning.
 
 - **Local** (`--correct`): uses Ollama on the host
-- **Cloud** (`--cloud-correct`): uses the latest GLM model via Z.ai OpenAI-compatible API
+- **Cloud** (`--cloud-correct`): uses the latest GLM model via Z.ai Anthropic-compatible API (`/api/anthropic/v1/messages`)
 
 Both produce a `.cleaned.txt` file alongside the verbatim `.txt`.
 
@@ -353,7 +354,7 @@ Both produce a `.cleaned.txt` file alongside the verbatim `.txt`.
 echo "your-key" > ~/.config/whisper/zai-key
 ```
 
-The model is auto-detected from the Z.ai models endpoint and cached for 24 hours in `~/.config/whisper/.glm-resolved`. Use `--refresh-model` to force re-detection.
+The model is auto-detected from the Z.ai models endpoint (OpenAI-compatible `/api/paas/v4/models`) and cached for 24 hours in `~/.config/whisper/.glm-resolved`. Use `--refresh-model` to force re-detection. Completions use the Anthropic-compatible endpoint (`/api/anthropic/v1/messages`) which shares the same API key.
 
 When using `--cloud-correct`, token usage is logged to stderr and a `cleaned_usage.json` sidecar file is written to the scratch directory with accumulated totals across all batches.
 
@@ -424,6 +425,8 @@ done
 docker build -t whisper-transcribe:2.0 .
 ```
 
+Build takes ~20 minutes on first run. The image pins specific versions of all dependencies (`ctranslate2==4.4.0`, `whisperx==3.4.2`, `pyannote.audio==3.4.0`, etc.). Pipeline code is volume-mounted at runtime, so the image does not need rebuilding for pipeline changes.
+
 ### 3. Create HuggingFace cache volume
 
 ```bash
@@ -451,21 +454,27 @@ Each pipeline stage can be run independently inside the container:
 
 ```bash
 # Preprocessing only
-docker run --rm --gpus all -v "$(pwd)":/audio whisper-transcribe:2.0 \
+docker run --rm --gpus all -v "$(pwd)":/audio \
+    -v ~/claudecode/projects/whisper/pipeline:/opt/pipeline:ro \
+    whisper-transcribe:2.0 \
     pipeline.preprocess /audio/file.m4a --scratch /audio/.scratch --enhance
 
 # ASR only
-docker run --rm --gpus all -v "$(pwd)":/audio whisper-transcribe:2.0 \
+docker run --rm --gpus all -v "$(pwd)":/audio \
+    -v ~/claudecode/projects/whisper/pipeline:/opt/pipeline:ro \
+    whisper-transcribe:2.0 \
     pipeline.asr_engines /audio/.scratch/preprocessed.wav --scratch /audio/.scratch
 
 # Diarization only
 docker run --rm --gpus all -v "$(pwd)":/audio \
+    -v ~/claudecode/projects/whisper/pipeline:/opt/pipeline:ro \
     -v ~/.config/whisper/hf-token:/run/secrets/hf-token:ro \
     whisper-transcribe:2.0 \
     pipeline.diarize /audio/.scratch/preprocessed.wav --output /audio/.scratch/diarize.json
 
 # Dump glossary
-docker run --rm whisper-transcribe:2.0 pipeline.glossary --dump
+docker run --rm -v ~/claudecode/projects/whisper/pipeline:/opt/pipeline:ro \
+    whisper-transcribe:2.0 pipeline.glossary --dump
 ```
 
 ### Intermediate files
@@ -491,8 +500,9 @@ Use `--keep-intermediates` to preserve the scratch directory (`.whisper-run-<pid
 
 ### Post-correction returns 0 corrections
 
-- The local LLM may not be effective at correcting Flemish phonetics
-- Try `--cloud-correct` with a Z.ai API key for better results
+- **Local (`--correct`):** Ollama models may not be effective at correcting Flemish phonetics
+- **Cloud (`--cloud-correct`):** uses the Z.ai Anthropic-compatible endpoint — requires a valid API key with credits at `~/.config/whisper/zai-key`
+- If you see "Insufficient balance" errors, the Z.ai account needs credits (the same key may work for other Z.ai services on different endpoints)
 - Ensure the glossary at `~/.config/whisper/glossary.txt` contains relevant entries
 
 ### Ollama sudo prompts
