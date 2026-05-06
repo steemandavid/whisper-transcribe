@@ -4,3 +4,8 @@ large-v3-support/
 
 # OS
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

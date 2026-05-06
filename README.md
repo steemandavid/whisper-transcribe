@@ -1,19 +1,26 @@
-# Local GPU-Accelerated Whisper Transcription with Speaker Diarization
+# Whisper Transcription Pipeline v2
 
-Self-hosted speech-to-text tool for transcribing audio recordings with speaker identification. Runs entirely locally inside a Docker container with NVIDIA GPU passthrough — no audio data leaves the machine.
+Self-hosted, GPU-accelerated speech-to-text with speaker diarization, multi-engine ASR, and LLM post-correction. Runs entirely locally in Docker — no audio data leaves the machine.
 
-Built around [WhisperX](https://github.com/m-bain/whisperX) (batched Whisper inference), [wav2vec2](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-dutch) (word-level alignment), and [pyannote](https://github.com/pyannote/pyannote-audio) (speaker diarization). Supports automatic vocabulary prompt generation via a local LLM and post-transcription summarization.
+## What's New in v2
+
+- **Multi-stage pipeline** — audio preprocessing, dual-engine ASR with ROVER reconciliation, LLM post-correction
+- **Audio preprocessing** — loudness normalisation, high-pass filtering, channel splitting for phone calls
+- **Two outputs** — verbatim transcript + LLM-cleaned transcript with corrected brand names and jargon
+- **Glossary support** — `wrong → right` mappings used in ASR, ROVER, and post-correction
+- **Python pipeline modules** — all heavy logic in `pipeline/`, bash script is just the orchestrator
 
 ## Features
 
 - **High-quality transcription** — Whisper large-v3 model with beam_size=10, best_of=10
 - **Speaker diarization** — identifies who said what using pyannote/speaker-diarization-3.1
 - **Word-level timestamps** — precise alignment via wav2vec2
-- **Auto-prompt** — iterative pipeline that uses a local LLM to extract domain-specific vocabulary from the audio itself
+- **Auto-prompt** — iterative pipeline that uses a local LLM to extract domain-specific vocabulary
 - **Manual prompts** — pass a vocabulary file for known domains
 - **Summaries** — LLM-generated summary, decisions, and action items appended to the transcript
+- **LLM post-correction** — fix brand names and phonetic mishearings (local Ollama or cloud GLM)
 - **GPU-accelerated** — ~2 minutes for a 42-minute recording on RTX 3090
-- **Privacy-first** — all processing happens locally, no cloud APIs
+- **Privacy-first** — all processing happens locally, no cloud APIs (unless `--cloud-correct`)
 
 ## Architecture
 
@@ -22,19 +29,50 @@ audio.m4a
      |
      v
 +---------------------------------------------+
-|  Docker container: whisper-transcribe        |
-|                                              |
-|  1. WhisperX (large-v3 model, pre-loaded)    |
-|     -> Transcription with vocabulary prompt  |
-|     -> beam_size=10, best_of=10, temp=0      |
-|                                              |
-|  2. wav2vec2 alignment (language-specific)   |
-|     -> Word-level timestamp alignment        |
-|                                              |
-|  3. pyannote speaker diarization             |
-|     -> Identifies SPEAKER_00, SPEAKER_01...  |
-|                                              |
-|  Output: .txt with speaker labels            |
+|  Stage 1: Audio Preprocessing               |
+|  - Loudness normalisation (ffmpeg loudnorm)  |
+|  - High-pass 80 Hz filter                    |
+|  - Stereo channel splitting for phone calls  |
++---------------------------------------------+
+     |
+     v
++---------------------------------------------+
+|  Stage 2: ASR (WhisperX large-v3)            |
+|  - Engine A: large-v3 with max quality       |
+|  - Engine B: Dutch fine-tune (nl audio only) |
+|  Output: asr_engine_a.json                   |
++---------------------------------------------+
+     |
+     v
++---------------------------------------------+
+|  Stage 3: ROVER Reconciliation (optional)    |
+|  - Merges Engine A + Engine B results        |
+|  - Without --ensemble, Engine A used as-is   |
+|  - Glossary-weighted majority vote           |
+|  Output: rover.json                          |
++---------------------------------------------+
+     |
+     v
++---------------------------------------------+
+|  Stage 4: Speaker Diarization                |
+|  - pyannote/speaker-diarization-3.1          |
+|  - Per-channel mode for stereo phone calls   |
+|  Output: diarize.json                        |
++---------------------------------------------+
+     |
+     v
++---------------------------------------------+
+|  Stage 5: LLM Post-Correction (optional)     |
+|  - Fixes brand names and phonetic errors     |
+|  - Local (Ollama) or cloud (GLM via Z.ai)    |
+|  Output: cleaned.json                        |
++---------------------------------------------+
+     |
+     v
++---------------------------------------------+
+|  Stage 6: Render                             |
+|  - audio.txt (verbatim, speaker-labeled)     |
+|  - audio.cleaned.txt (post-corrected)        |
 +---------------------------------------------+
      |
      v
@@ -45,112 +83,133 @@ NVIDIA GPU (CUDA, ~8 GB peak VRAM)
 
 ```
 ~/claudecode/projects/whisper/
-+-- Dockerfile            Container definition (CUDA runtime + WhisperX + pyannote)
-+-- transcribe            Main bash wrapper script (entry point)
++-- Dockerfile            Multi-stage build (CUDA runtime + WhisperX + pyannote)
++-- transcribe            Bash orchestrator (entry point)
++-- pipeline/             Python pipeline modules
+|   +-- __init__.py
+|   +-- artifacts.py      RunPaths + JSON helpers
+|   +-- glossary.py       Glossary loader + seeder
+|   +-- prompt_builder.py Prompt sanitiser + builder
+|   +-- preprocess.py     Audio preprocessing
+|   +-- asr_engines.py    Multi-engine ASR
+|   +-- rover.py          ROVER reconciliation
+|   +-- diarize.py        Speaker diarization
+|   +-- postcorrect.py    LLM post-correction
+|   +-- render.py         Transcript text rendering
 +-- model.bin             Pre-downloaded large-v3 model (2.9 GB)
-+-- large-v3-support/     Tokenizer, vocab, config files for large-v3
-|   +-- config.json
-|   +-- preprocessor_config.json
-|   +-- tokenizer.json
-|   +-- vocabulary.json
-+-- .gitignore            Excludes model.bin and large-v3-support/ from git
-+-- README.md             This file
++-- large-v3-support/     Tokenizer, vocab, config files
++-- .gitignore
++-- README.md
 
 ~/.config/whisper/
-+-- hf-token              HuggingFace API token (read-only mount into container)
++-- hf-token              HuggingFace API token (read-only mount)
++-- glossary.txt          Default glossary (wrong → right mappings)
++-- zai-key               Z.ai API key (optional, for --cloud-correct)
++-- .glm-resolved         Cached GLM model id (auto-managed, 24h TTL)
 
 ~/Documents/transcribe nl/
-+-- prompt-medisch.txt            Example vocabulary prompt file
++-- prompt-medisch.txt    Example vocabulary prompt file
 ```
 
 ### Docker Resources
 
 | Resource | Name | Purpose |
 |----------|------|---------|
-| Image | `whisper-transcribe` | ~7 GB with baked-in large-v3 model |
+| Image | `whisper-transcribe:2.0` | ~20 GB with pre-baked models |
 | Volume | `whisper-hf-cache` | Persistent HuggingFace model cache |
-| Token mount | `~/.config/whisper/hf-token` | HuggingFace credentials (read-only) |
 
 ## Usage
 
-### Basic transcription
+### Quick start with quality preset
 
 ```bash
-~/claudecode/projects/whisper/transcribe "./file.m4a" --model large-v3 --language nl
-```
+# Recommended for most use cases
+~/claudecode/projects/whisper/transcribe "./file.m4a" --quality good --language nl
 
-### Quick transcription with quality preset
+# Maximum quality with all enhancements
+~/claudecode/projects/whisper/transcribe "./file.m4a" --quality perfect
 
-```bash
-# Fast — small model, lower accuracy, quickest results
+# Quick draft
 ~/claudecode/projects/whisper/transcribe "./file.m4a" --quality fast --language nl
-
-# Good — large-v3 model with iterative auto-prompt (recommended for most use cases)
-~/claudecode/projects/whisper/transcribe "./file.m4a" --quality good --language nl --auto-prompt
-
-# Perfect — large-v3 for all stages including scans, maximum quality
-~/claudecode/projects/whisper/transcribe "./file.m4a" --quality perfect --language nl --auto-prompt
 ```
 
-### With a manual vocabulary prompt
+### With auto-prompt and summary
 
 ```bash
 ~/claudecode/projects/whisper/transcribe "./file.m4a" \
-    --model large-v3 --language nl --prompt prompt-gemeentediensten.txt
+    --quality perfect --language nl --auto-prompt --summary
 ```
 
-### With auto-generated vocabulary prompt
+### With LLM post-correction
+
+```bash
+# Local LLM correction (Ollama)
+~/claudecode/projects/whisper/transcribe "./file.m4a" \
+    --quality perfect --language nl --correct
+
+# Cloud correction (GLM via Z.ai, requires zai-key)
+~/claudecode/projects/whisper/transcribe "./file.m4a" \
+    --quality perfect --language nl --cloud-correct
+```
+
+### With manual vocabulary prompt
 
 ```bash
 ~/claudecode/projects/whisper/transcribe "./file.m4a" \
-    --model large-v3 --language nl --auto-prompt
-```
-
-### With summary appended to transcript
-
-```bash
-~/claudecode/projects/whisper/transcribe "./file.m4a" \
-    --model large-v3 --language nl --summary
-```
-
-### Combined: auto-prompt + summary
-
-```bash
-~/claudecode/projects/whisper/transcribe "./file.m4a" \
-    --model large-v3 --language nl --auto-prompt --summary
+    --model large-v3 --language nl --prompt prompt-file.txt
 ```
 
 ### Output format
 
-The transcript is written to a `.txt` file alongside the audio file:
+Two files are produced (verbatim and cleaned):
 
 ```
+# audio.txt (verbatim)
 [SPEAKER_00]
-  Goedemorgen, ik heb een afspraak om 9 uur.
-  Ik wilde het projectoverzicht bespreken.
+  Goedemorgen, ik heb hier net mijn man met de vloek.
+  Ik weet niet of we al een gigantisch veel werk...
 
 [SPEAKER_01]
-  Ja, kom maar binnen.
-  Waar kan ik u mee helpen?
+  Ja, kom maar binnen. Waar kan ik u mee helpen?
 ```
 
-With `--summary`, a structured summary is appended:
+```
+# audio.cleaned.txt (post-corrected)
+[SPEAKER_00]
+  Goedemorgen, ik heb hier net mijn man met de Fluke.
+  Ik weet niet of we al een gigantisch veel werk...
+```
+
+With `--summary`, a structured summary is appended to the verbatim file:
 
 ```
 ---
 
 ## Samenvatting
-Het team besprak de voortgang van het bouwproject en de
-leveringsproblemen bij de hoofdaannemer...
+Het team besprak de voortgang van het bouwproject...
 
 ## Beslissingen
-- De fundering wordt volgende week afgerond conform planning...
-- Er wordt overgestapt op een alternatieve leverancier voor staal...
+- De fundering wordt volgende week afgerond...
 
 ## Actiepunten
-- [ ] Offerte aanvragen bij de nieuwe leverancier voor staalprofelen...
-- [ ] Planning update delen met de opdrachtgever uiterlijk vrijdag...
+- [ ] Offerte aanvragen bij de nieuwe leverancier...
 ```
+
+### Pipeline summary
+
+At the end of each run, the script prints a summary of which stages ran vs were skipped:
+
+```
+=== Pipeline summary ===
+Ran:     preprocess asr (large-v3) diarize post-correct (12 segments fixed)
+Skipped: ensemble (engine B unavailable)
+
+=== Pipeline summary ===
+Ran:     preprocess asr (large-v3) ensemble (engine B + ROVER) diarize post-correct (8 segments fixed)
+Skipped: (none)
+```
+
+This makes it clear which stages were actually active for a given run, especially when using `--quality perfect` where some stages may silently skip (e.g. DeepFilterNet or AudioSR if not installed).
 
 ## CLI Reference
 
@@ -174,242 +233,160 @@ transcribe <audio_file> [options]
 | `--prompt` | `-p` | path to text file | none | Vocabulary/context hints file |
 | `--auto-prompt` | `-a` | (boolean flag) | off | Auto-generate vocabulary via Ollama |
 | `--summary` | `-s` | (boolean flag) | off | Append LLM summary to transcript |
-| `--ollama-model` | `-o` | Ollama model name | auto-select | Override Ollama model selection |
-| `--help` | `-h` | | | Show usage |
+| `--enhance` | | (boolean flag) | off | Enable audio preprocessing |
+| `--denoise` | | (boolean flag) | off | Enable DeepFilterNet3 denoising |
+| `--ensemble` | | (boolean flag) | off | Run multi-engine ASR with ROVER |
+| `--correct` | | (boolean flag) | off | LLM post-correction (local Ollama) |
+| `--cloud-correct` | | (boolean flag) | off | LLM post-correction (cloud GLM via Z.ai) |
+| `--no-enhance` | | (boolean flag) | off | Override preset: disable audio preprocessing |
+| `--no-denoise` | | (boolean flag) | off | Override preset: disable denoising |
+| `--no-ensemble` | | (boolean flag) | off | Override preset: disable multi-engine ASR |
+| `--no-correct` | | (boolean flag) | off | Override preset: disable post-correction |
+| `--refresh-model` | | (boolean flag) | off | Force re-query of GLM models endpoint |
+| `--context` | | free text | none | Context for prompt building |
+| `--speakers` | | number | auto | Pin speaker count for diarization |
+| `--glossary` | | path | `~/.config/whisper/glossary.txt` | Glossary file |
+| `--diarize-model` | | 3.1, community-1 | 3.1 | Diarization model variant |
+| `--ollama-model` | `-o` | model name | auto-select | Override Ollama model |
+| `--keep-intermediates` | | (boolean flag) | off | Preserve scratch dir for debugging |
 
 ### Mutually exclusive options
 
 - `--auto-prompt` and `--prompt` cannot be used together
 
-### Notes
-
-- The script requires `sudo` to start/stop Ollama for VRAM management
-- Audio files are mounted into the container from their current directory — no copying needed
-- Output is always written to the same directory as the input file
-
 ## Quality Presets
 
-The `--quality` flag sets a preset that configures the scan model (used in auto-prompt quick scans), the final transcription model, and quality parameters. Use it instead of manually specifying `--model` and quality params.
+The `--quality` flag sets a preset that configures models and enhancement flags:
 
-### Presets
+| Preset | Scan model | Final model | Enhance | Denoise | Ensemble | Correct | Use case |
+|--------|-----------|-------------|---------|---------|----------|---------|----------|
+| `fast` | base | small | off | off | off | off | Quick drafts |
+| `medium` | base | medium | off | off | off | off | Good balance |
+| `good` | medium | large-v3 | off | off | off | off | High quality |
+| `perfect` | large-v3 | large-v3 | on | on | on | on (local) | Maximum quality |
 
-| Preset | Scan model | Final model | beam_size | best_of | batch_size | Use case |
-|--------|-----------|-------------|-----------|---------|------------|----------|
-| `fast` | base | small | 2 | 2 | 16 | Quick drafts, testing |
-| `medium` | base | medium | 5 | 5 | 12 | Good balance of speed and quality |
-| `good` | medium | large-v3 | 10 | 10 | 8 | High quality (recommended) |
-| `perfect` | large-v3 | large-v3 | 10 | 10 | 8 | Maximum quality, slower scans |
-
-### Interaction with `--model`
-
-- `--model` overrides the final transcription model from the quality preset
-- `--quality good --model medium` uses medium scan + medium final (overriding large-v3)
-- Without `--quality`, the default is medium model with max quality parameters (backward compatible)
-
-### Examples
-
-```bash
-# Recommended for most use cases
-~/claudecode/projects/whisper/transcribe "audio.m4a" --quality good --language nl
-
-# Quick draft to check what's in a recording
-~/claudecode/projects/whisper/transcribe "audio.m4a" --quality fast --language nl
-
-# Maximum quality with auto-prompt and summary
-~/claudecode/projects/whisper/transcribe "audio.m4a" --quality perfect --language nl --auto-prompt --summary
-
-# Override just the final model while keeping preset quality params
-~/claudecode/projects/whisper/transcribe "audio.m4a" --quality fast --model large-v3 --language nl
-```
+- `--model` overrides the final transcription model from the preset
+- `--no-enhance`, `--no-denoise`, `--no-ensemble`, `--no-correct` override individual preset flags (e.g. `--quality perfect --no-correct`)
+- Without `--quality`, the default is medium model with max quality parameters
 
 ### Performance by quality level
 
 For a ~42-minute audio file on RTX 3090:
 
-| Quality | Without auto-prompt | With auto-prompt |
-|---------|-------------------|-----------------|
-| fast | ~30s | ~1 min |
-| medium | ~1 min | ~1.5 min |
-| good | ~2 min | ~2.5 min |
-| perfect | ~2 min | ~4 min |
+| Quality | Time | Notes |
+|---------|------|-------|
+| fast | ~30s | Small model |
+| medium | ~1 min | Medium model |
+| good | ~2 min | Large-v3, no enhancements |
+| perfect | ~3-5 min | Large-v3 + all enhancements + post-correction |
 
-The "perfect" preset is slower with auto-prompt because the quick scan stages use large-v3 instead of medium (~42s per scan instead of ~10s).
+## Glossary
+
+The glossary maps common misrecognitions to their correct forms. It's used in three places:
+1. **Prompt builder** — canonical terms appended to vocabulary hints
+2. **ROVER tie-breaker** — glossary terms preferred in reconciliation
+3. **Post-correction** — full glossary embedded in LLM system prompt
+
+### Format
+
+```
+# Comments start with #
+# Sections: [brand], [person], [place], [term]
+# Brands have highest weight, terms lowest
+
+[brand]
+vloek -> Fluke
+annexter -> Anixter
+comscope -> CommScope
+connect-wise -> ConnectWise
+
+[person]
+brent -> Brent
+
+[place]
+berendrechtstraat -> Berendrechtstraat
+```
+
+### Locations
+
+The glossary is loaded from the first found:
+1. `--glossary FILE` (explicit override)
+2. `/run/glossary.txt` (container mount)
+3. `~/.config/whisper/glossary.txt` (default)
 
 ## Auto-Prompt Pipeline
 
-The `--auto-prompt` flag enables a 5-step iterative pipeline that generates a vocabulary prompt automatically, using a local LLM running via Ollama.
+The `--auto-prompt` flag enables a multi-step pipeline that generates vocabulary automatically:
 
-### How it works
+1. **Quick scan** — Whisper base/medium model produces rough transcript
+2. **Keyword extraction** — Ollama LLM extracts domain terms from rough text
+3. **Refined scan** — Re-run with extracted vocabulary for cleaner text
+4. **Keyword refinement** — LLM refines keywords against cleaner text
+5. **Final transcription** — Full large-v3 with refined prompt
 
-```
-audio.m4a
-  |
-  +-- Step 1: Quick scan (Whisper medium model, ~10s on GPU)
-  |    -> rough transcript text
-  |
-  +-- Step 2: Keyword extraction (Ollama LLM)
-  |    -> comma-separated vocabulary list (prompt v1)
-  |
-  +-- Step 3: Refined scan (Whisper medium + prompt v1, ~10s on GPU)
-  |    -> cleaner transcript text
-  |
-  +-- Step 4: Keyword refinement (Ollama LLM)
-  |    -> refined vocabulary list (prompt v2)
-  |
-  +-- Step 5: Full transcription (Whisper large-v3 + prompt v2)
-       -> aligned, speaker-identified transcript
-```
-
-The iteration matters. Step 1 produces rough text with misrecognized words. The LLM extracts keywords from this rough text (step 2), which may include some errors. But feeding those keywords back into a second scan (step 3) produces significantly cleaner text, because the vocabulary hints correct the worst misrecognitions. The LLM then refines the keyword list against the cleaner text (step 4), removing false positives and adding missed terms. The refined prompt goes into the final large-v3 transcription.
+The prompt builder sanitises all LLM output — stripping ANSI codes, thinking blocks, and enforcing length limits to prevent the "poisoned prompt" issue from v1.
 
 ### Ollama model selection
 
-When `--ollama-model` is not specified, the script auto-selects the best available model using `select_ollama_model()`:
-
-- Scans `ollama list` for installed models
-- Excludes embedding models
-- Penalizes coder-specific models (0.7x multiplier)
-- Penalizes qwen3 models (0.5x — aggressive thinking mode cannot be reliably disabled)
-- Bonuses instruct variants (1.3x — better at following extraction prompts)
-- Applies a generation bonus based on version number (e.g. qwen3 > qwen2.5)
+When `--ollama-model` is not specified, the script auto-selects the best available model, penalising qwen3 (thinking mode issues) and coder-specific models.
 
 ### VRAM management
 
-Ollama normally consumes ~20 GB of the 24 GB VRAM on an RTX 3090. The pipeline manages the lifecycle:
+Ollama and WhisperX share the GPU. The pipeline manages the lifecycle:
+- Ollama stopped → WhisperX uses GPU
+- Ollama started → LLM keyword extraction (CPU)
+- On exit: Ollama restarted only if it was running before
 
-1. Ollama stopped -> Step 1 (scan model, GPU — varies by `--quality`)
-2. Ollama started -> Step 2 (LLM keyword extraction, CPU)
-3. Ollama stopped -> Step 3 (scan model with prompt v1, GPU)
-4. Ollama started -> Step 4 (LLM keyword refinement, CPU)
-5. Ollama stopped -> Step 5 (final model, GPU)
-6. On exit: Ollama restarted only if it was running before the script
+## Post-Correction
 
-### Fallback behavior
+The `--correct` or `--cloud-correct` flags run LLM post-correction on the transcript. The LLM receives the verbatim transcript, glossary, and context, and corrects phonetic mishearings while preserving the original meaning.
 
-| Condition | Behavior |
-|-----------|----------|
-| Quick scan produces no output | Warn, fall back to no prompt |
-| Ollama not installed or not running | Warn, fall back to no prompt |
-| Model not found in `ollama list` | Warn, show available models, fall back to no prompt |
-| Ollama returns empty result | Warn, fall back to no prompt |
-| Any error in steps 1-4 | Script continues with full transcription (no prompt) |
+- **Local** (`--correct`): uses Ollama on the host
+- **Cloud** (`--cloud-correct`): uses the latest GLM model via Z.ai OpenAI-compatible API
 
-## Summary Feature
+Both produce a `.cleaned.txt` file alongside the verbatim `.txt`.
 
-The `--summary` flag generates a structured summary after transcription using a local LLM via Ollama. The summary includes:
+### Z.ai setup (optional, for cloud correction)
 
-1. **Samenvatting** — concise overview (3-5 sentences)
-2. **Beslissingen** — key decisions or conclusions
-3. **Actiepunten** — action items with checkboxes
+```bash
+# Get an API key from Z.ai
+echo "your-key" > ~/.config/whisper/zai-key
+```
 
-The LLM is instructed to respond in the same language as the transcript and to include specific names, places, and numbers.
+The model is auto-detected from the Z.ai models endpoint and cached for 24 hours in `~/.config/whisper/.glm-resolved`. Use `--refresh-model` to force re-detection.
 
-### Combining with auto-prompt
-
-Both flags can be used together. The auto-prompt pipeline runs first to produce an optimal vocabulary, then the final transcription uses that vocabulary, and the summary is generated from the resulting transcript.
+When using `--cloud-correct`, token usage is logged to stderr and a `cleaned_usage.json` sidecar file is written to the scratch directory with accumulated totals across all batches.
 
 ## Vocabulary Prompt Files
 
-A vocabulary prompt file is a plain text file containing domain-specific terms that improve Whisper's recognition accuracy. It is passed via Whisper's `initial_prompt` parameter, which primes the model before transcription begins.
+A vocabulary prompt file is a plain text file containing domain-specific terms passed via Whisper's `initial_prompt` parameter.
 
-### Example (medical consultation context)
+### Example
 
 ```
 Dit is een medisch consult. De gesprekken gaan over hypertensie,
-diabetes mellitus, cholesterol, bloeddruk, receptuur, huisarts,
-specialist, verwijzing, bloedonderzoek, recept, dosering,
-bijwerkingen, chronische aandoening, preventief onderzoek,
-vaccinatie, longfunctie, physiotherapie, orthopedie, revalidatie.
+diabetes mellitus, cholesterol, bloeddruk, receptuur, huisarts.
 ```
 
-### Guidelines for writing prompt files
+### Guidelines
 
-- Keep it under ~1500 characters (Whisper's initial_prompt has limits)
-- Include proper nouns that the model might misrecognize
-- Include domain-specific jargon and technical terms
+- Keep it under ~1500 characters
+- Include proper nouns and domain-specific jargon
 - Use the same language as the audio
 - Natural sentences work better than bare word lists
-- Create separate files for different contexts (medical, legal, business, etc.)
-
-## Quality Settings
-
-Quality parameters are set via `--quality` presets (see Quality Presets above). The parameters that vary between presets:
-
-| Parameter | fast | medium | good / perfect | Purpose |
-|-----------|------|--------|----------------|---------|
-| `beam_size` | 2 | 5 | 10 | Searches more candidate translations |
-| `best_of` | 2 | 5 | 10 | Samples more candidates before beam search |
-| `batch_size` | 16 | 12 | 8 | Smaller batches for more careful processing |
-
-These parameters are always enabled regardless of preset:
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| `temperatures` | [0] | Deterministic greedy decoding |
-| `condition_on_previous_text` | True | Uses prior context for consistency |
-| `compression_ratio_threshold` | 2.4 | Filter unlikely segments |
-| `no_speech_threshold` | 0.6 | Skip silence |
-| `log_prob_threshold` | -1.0 | Filter low-confidence segments |
-
-## Performance
-
-For a ~42-minute audio file on an NVIDIA RTX 3090 (with `--quality good`, i.e. large-v3 model):
-
-### Standard transcription (no auto-prompt)
-
-| Stage | Time |
-|-------|------|
-| Model load | ~5s |
-| Transcription | ~42s (58x realtime) |
-| Alignment | ~5s |
-| Speaker diarization | ~60s |
-| **Total** | **~2 min** |
-
-### With auto-prompt enabled
-
-| Stage | Time |
-|-------|------|
-| Quick scan (medium model) | ~10s |
-| Keyword extraction (LLM) | ~15s |
-| Refined scan (medium model) | ~10s |
-| Keyword refinement (LLM) | ~15s |
-| Final transcription + alignment + diarization | ~2 min |
-| **Total** | **~2.5 min** |
-
-See the Quality Presets section for timing at different quality levels.
-
-### With summary
-
-Adds ~30s for the LLM summary generation (Ollama start + inference + stop).
-
-### VRAM usage
-
-| Component | VRAM |
-|-----------|------|
-| WhisperX + large-v3 | ~4.5 GB |
-| Alignment model | ~1 GB (loaded then unloaded) |
-| Diarization model | ~2 GB (loaded then unloaded) |
-| **Peak** | **~8 GB** |
-
-Comfortable fit with 24 GB RTX 3090. Ollama (~20 GB) is stopped during GPU operations.
 
 ## Prerequisites
 
 ### Hardware
 
 - NVIDIA GPU with at least 8 GB VRAM
-- Sufficient disk space: ~7 GB for Docker image, ~3 GB for HuggingFace cache volume
+- ~20 GB disk space for Docker image + models
 
 ### Software
 
-- Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed
+- Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 - `jq` (for Ollama API JSON processing)
-- Optional: Ollama with a suitable model for `--auto-prompt` and `--summary`
-
-Verify GPU passthrough:
-```bash
-docker run --rm --gpus all nvidia/cuda:12.4.0-runtime-ubuntu22.04 nvidia-smi
-```
+- Optional: Ollama with a model for `--auto-prompt`, `--summary`, and `--correct`
 
 ### HuggingFace account setup
 
@@ -423,30 +400,14 @@ docker run --rm --gpus all nvidia/cuda:12.4.0-runtime-ubuntu22.04 nvidia-smi
 
 The token is required for speaker diarization. Without it, transcription and alignment still work but speakers won't be identified.
 
-### Ollama setup (optional, for auto-prompt and summary)
-
-```bash
-# Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Download a model (recommended)
-ollama pull qwen2.5:32b-instruct-q4_K_M
-```
-
-The auto-prompt and summary features work with any Ollama model. The script auto-selects the best available model. Recommended: a 30B+ instruct model for best keyword extraction quality.
-
 ## Building from Scratch
 
-### 1. Clone the repository
+### 1. Clone and download model
 
 ```bash
 git clone https://github.com/steemandavid/whisper-transcribe.git ~/claudecode/projects/whisper
 cd ~/claudecode/projects/whisper
-```
 
-### 2. Download the large-v3 model
-
-```bash
 # Download model weights (2.9 GB)
 wget -O model.bin https://huggingface.co/Systran/faster-whisper-large-v3/resolve/main/model.bin
 
@@ -457,87 +418,105 @@ for f in config.json preprocessor_config.json tokenizer.json vocabulary.json; do
 done
 ```
 
-These files are excluded from git via `.gitignore` due to their size.
-
-### 3. Build the Docker image
+### 2. Build Docker image
 
 ```bash
-docker build -t whisper-transcribe .
+docker build -t whisper-transcribe:2.0 .
 ```
 
-The image is ~7 GB (includes CUDA runtime, WhisperX, pyannote, and the large-v3 model). The build takes 5-10 minutes depending on download speed.
-
-### 4. Create the HuggingFace cache volume
+### 3. Create HuggingFace cache volume
 
 ```bash
 docker volume create whisper-hf-cache
 ```
 
-This stores alignment and diarization models after their first download, so they don't need to be re-downloaded on every run.
+### 4. Seed the glossary
+
+```bash
+# Seed the default glossary (safe to re-run — won't overwrite an existing file):
+docker run --rm whisper-transcribe:2.0 pipeline.glossary --seed
+```
 
 ### 5. Run
 
 ```bash
-~/claudecode/projects/whisper/transcribe "./audio.m4a" --model large-v3 --language nl
+~/claudecode/projects/whisper/transcribe "./audio.m4a" --quality perfect
+```
+
+## Debugging
+
+### Per-stage invocation
+
+Each pipeline stage can be run independently inside the container:
+
+```bash
+# Preprocessing only
+docker run --rm --gpus all -v "$(pwd)":/audio whisper-transcribe:2.0 \
+    pipeline.preprocess /audio/file.m4a --scratch /audio/.scratch --enhance
+
+# ASR only
+docker run --rm --gpus all -v "$(pwd)":/audio whisper-transcribe:2.0 \
+    pipeline.asr_engines /audio/.scratch/preprocessed.wav --scratch /audio/.scratch
+
+# Diarization only
+docker run --rm --gpus all -v "$(pwd)":/audio \
+    -v ~/.config/whisper/hf-token:/run/secrets/hf-token:ro \
+    whisper-transcribe:2.0 \
+    pipeline.diarize /audio/.scratch/preprocessed.wav --output /audio/.scratch/diarize.json
+
+# Dump glossary
+docker run --rm whisper-transcribe:2.0 pipeline.glossary --dump
+```
+
+### Intermediate files
+
+Use `--keep-intermediates` to preserve the scratch directory (`.whisper-run-<pid>/`) for debugging. It contains JSON artifacts from each stage:
+
+```
+.whisper-run-12345/
++-- preprocessed.wav          Stage 1 output
++-- preprocess.json           Stage 1 metadata
++-- asr_engine_a.json         Stage 2 Engine A output
++-- diarize.json              Stage 4 diarization output
++-- cleaned.json              Stage 5 post-correction output
 ```
 
 ## Troubleshooting
 
 ### GPU not used / CUDA out of memory
 
-- Check what's consuming VRAM: `nvidia-smi`
-- Ollama typically uses ~20 GB — the script handles stopping/restarting it automatically
-- If another process is using the GPU, stop it before running transcription
-- Verify GPU passthrough: `docker run --rm --gpus all nvidia/cuda:12.4.0-runtime-ubuntu22.04 nvidia-smi`
+- Check VRAM: `nvidia-smi`
+- Ollama uses ~20 GB — the script manages stopping/restarting it
+- Verify GPU passthrough: `docker run --rm --gpus all whisper-transcribe:2.0 python3 -c "import torch; print(torch.cuda.is_available())"`
 
-### `libcublas.so.12` not found
+### Post-correction returns 0 corrections
 
-The Dockerfile uses `nvidia/cuda:12.4.0-runtime-ubuntu22.04` (runtime variant). If you modify the Dockerfile, do **not** use the `base` variant — it's missing the required CUDA runtime libraries.
+- The local LLM may not be effective at correcting Flemish phonetics
+- Try `--cloud-correct` with a Z.ai API key for better results
+- Ensure the glossary at `~/.config/whisper/glossary.txt` contains relevant entries
 
-### Model download hangs at build time
+### Ollama sudo prompts
 
-- Without a HuggingFace token, downloads are rate-limited
-- Pass `--build-arg HF_TOKEN=$(cat ~/.config/whisper/hf-token)` to `docker build` for faster downloads
-- Alternatively, download `model.bin` and supporting files manually (see Building from Scratch)
+The script uses `sudo systemctl` to manage Ollama. If your user doesn't have passwordless sudo, Ollama will remain running. This works fine if Ollama isn't actively using the GPU (models load on demand).
 
-### Alignment model download hangs at runtime
+### `libcudnn_ops_infer.so.8` warning
 
-- Ensure the HF token is saved at `~/.config/whisper/hf-token`
-- The `whisper-hf-cache` Docker volume persists downloaded models across runs
-- If a previous download failed, a `.no_exist` marker file may block future downloads:
-  ```bash
-  # Clean stale markers from the volume
-  docker run --rm -v whisper-hf-cache:/cache alpine find /cache -name '.no_exist' -delete
-  ```
-
-### `GatedRepoError: 403`
-
-Accept the model terms on the HuggingFace website (see Prerequisites). There are three separate models to accept — the error message doesn't tell you which one is missing.
-
-### Ollama returns empty results for auto-prompt
-
-- qwen3 models have aggressive thinking mode that can't be reliably disabled — the script penalizes them in model selection
-- Use `--ollama-model qwen2.5:32b-instruct-q4_K_M` to force a specific model
-- Check that Ollama is running: `systemctl status ollama`
-- Check available models: `ollama list`
+This is a harmless warning from a secondary code path. ctranslate2 4.5.0 uses cuDNN 9 correctly.
 
 ### Docker image not building
 
-- Ensure the model files are in place: `ls -la model.bin large-v3-support/`
-- Ensure `model.bin` is ~2.9 GB (a truncated download will cause build failures)
-- Check disk space — the build needs ~10 GB temporarily
-
-### Transcript file is owned by root
-
-The container runs as root, so output files are created as root. The script handles this with `os.chmod(0o666)` inside the container to make the file writable by all users.
+- Network timeouts during `pip install` are common — retry the build
+- Ensure model files are in place: `ls -la model.bin large-v3-support/`
+- Check disk space — the build needs ~25 GB temporarily
 
 ## Backup Coverage
 
 | What | Location | Backup |
 |------|----------|--------|
-| Docker image data | `/storage/docker` | Daily Borg -> USB, Weekly -> NAS |
-| Docker volume (HF cache) | Docker-managed at `/storage/docker/volumes/whisper-hf-cache/` | Included in Docker data backups |
-| Project files (script, Dockerfile) | `~/claudecode/projects/whisper/` | Daily system backup |
+| Docker image data | `/storage/docker` | Daily Borg → USB, Weekly → NAS |
+| Docker volume (HF cache) | Docker-managed | Included in Docker data backups |
+| Project files | `~/claudecode/projects/whisper/` | Daily system backup |
 | HF token | `~/.config/whisper/hf-token` | Daily system backup |
+| Glossary | `~/.config/whisper/glossary.txt` | Daily system backup |
 | Prompt files | `~/Documents/transcribe nl/` | Daily system backup |
-| Model weights | `model.bin` + `large-v3-support/` | Excluded from git; re-downloadable from HuggingFace |
+| Model weights | `model.bin` + `large-v3-support/` | Re-downloadable from HuggingFace |
