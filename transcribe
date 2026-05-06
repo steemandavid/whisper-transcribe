@@ -564,7 +564,7 @@ if $CORRECT && [ -f "$SCRATCH/cleaned.json" ]; then
     RENDER_ARGS+=(--cleaned "/audio/.whisper-run-$$/cleaned.json" --cleaned-out "/audio/$INPUT_BASE.cleaned.txt")
 fi
 
-docker run --rm "${DOCKER_ARGS[@]}" "$IMAGE" \
+docker run --rm --user "$(id -u):$(id -g)" "${DOCKER_ARGS[@]}" "$IMAGE" \
     pipeline.render "${RENDER_ARGS[@]}"
 
 # Fix permissions (container writes as root)
