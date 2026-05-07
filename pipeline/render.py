@@ -8,6 +8,7 @@ Produces two outputs:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
@@ -86,12 +87,20 @@ def run(
     # Verbatim output
     verbatim_text = render_text(segments, turns)
     verbatim_out.write_text(verbatim_text, encoding="utf-8")
+    try:
+        os.chmod(verbatim_out, 0o666)
+    except OSError:
+        pass
 
     # Cleaned output (if post-correction ran)
     if cleaned_out and cleaned:
         cleaned_segments = cleaned.get("segments", segments)
         cleaned_text = render_text(cleaned_segments, turns)
         cleaned_out.write_text(cleaned_text, encoding="utf-8")
+        try:
+            os.chmod(cleaned_out, 0o666)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

@@ -564,7 +564,9 @@ if $CORRECT && [ -f "$SCRATCH/cleaned.json" ]; then
     RENDER_ARGS+=(--cleaned "/audio/.whisper-run-$$/cleaned.json" --cleaned-out "/audio/$INPUT_BASE.cleaned.txt")
 fi
 
-docker run --rm --user "$(id -u):$(id -g)" "${DOCKER_ARGS[@]}" "$IMAGE" \
+docker run --rm "${DOCKER_ARGS[@]}" \
+    -v "$SCRIPT_DIR/pipeline:/opt/pipeline:ro" \
+    "$IMAGE" \
     pipeline.render "${RENDER_ARGS[@]}"
 
 # Fix permissions (container writes as root)
@@ -674,8 +676,25 @@ SUMMARY_PROMPT
             ollama_stop_for_gpu
 
             if [ -n "$SUMMARY_TEXT" ]; then
-                { echo ""; echo "---"; echo ""; echo "$SUMMARY_TEXT"; } >> "$OUTPUT_FILE"
-                echo "Summary appended."
+                SUMMARY_TMP=$(mktemp)
+                { echo ""; echo "---"; echo ""; echo "$SUMMARY_TEXT"; } > "$SUMMARY_TMP"
+                SUMMARY_OK=false
+                docker run --rm "${DOCKER_ARGS[@]}" \
+                    -v "$SUMMARY_TMP:/tmp/summary.txt:ro" \
+                    --entrypoint sh "$IMAGE" \
+                    -c "cat /tmp/summary.txt >> \"/audio/$INPUT_BASE.txt\"" 2>/dev/null \
+                    && SUMMARY_OK=true
+                if ! $SUMMARY_OK; then
+                    { echo ""; echo "---"; echo ""; echo "$SUMMARY_TEXT"; } >> "$OUTPUT_FILE" 2>/dev/null \
+                    && SUMMARY_OK=true
+                fi
+                rm -f "$SUMMARY_TMP"
+                if $SUMMARY_OK; then
+                    echo "Summary appended."
+                else
+                    echo "Warning: Could not append summary to transcript."
+                    echo "$SUMMARY_TEXT"
+                fi
             else
                 echo "Warning: Empty summary."
             fi
