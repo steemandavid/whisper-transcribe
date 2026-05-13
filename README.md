@@ -146,7 +146,7 @@ NVIDIA GPU (CUDA, ~8 GB peak VRAM)
 ```bash
 # Local LLM correction (Ollama)
 ~/claudecode/projects/whisper/transcribe "./file.m4a" \
-    --quality perfect --language nl --correct
+    --quality perfect --language nl --auto-prompt --summary --correct
 
 # Cloud correction (GLM via Z.ai, requires zai-key)
 ~/claudecode/projects/whisper/transcribe "./file.m4a" \
