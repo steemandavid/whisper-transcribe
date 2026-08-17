@@ -1,3 +1,9 @@
+
+
+~/claudecode/projects/whisper/transcribe --quality perfect --language nl --cloud-correct --auto-prompt --summary 
+
+
+
 # Whisper Transcription Pipeline v2
 
 Self-hosted, GPU-accelerated speech-to-text with speaker diarization, multi-engine ASR, and LLM post-correction. Runs entirely locally in Docker — no audio data leaves the machine.
@@ -124,11 +130,13 @@ NVIDIA GPU (CUDA, ~8 GB peak VRAM)
 ### Quick start with quality preset
 
 ```bash
-# Recommended for most use cases
-~/claudecode/projects/whisper/transcribe "./file.m4a" --quality good --language nl
 
 # Maximum quality with all enhancements
-~/claudecode/projects/whisper/transcribe "./file.m4a" --quality perfect
+~/claudecode/projects/whisper/transcribe --quality perfect --language nl --cloud-correct --auto-prompt --summary 
+
+
+# Recommended for most use cases
+~/claudecode/projects/whisper/transcribe "./file.m4a" --quality good --language nl
 
 # Quick draft
 ~/claudecode/projects/whisper/transcribe "./file.m4a" --quality fast --language nl
