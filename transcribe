@@ -347,9 +347,9 @@ EXTRACT_PROMPT
             echo "$ROUGH_TEXT" >> "$OLLAMA_PROMPT_FILE"
             echo "---" >> "$OLLAMA_PROMPT_FILE"
 
-            AUTO_PROMPT_TEXT=$(curl -s --max-time 300 http://localhost:11434/api/chat \
-                -d "$(jq -nc --arg model "$OLLAMA_MODEL" --rawfile prompt "$OLLAMA_PROMPT_FILE" \
-                    '{model: $model, messages: [{role: "system", content: "/no_think"}, {role: "user", content: $prompt}], stream: false, think: false, options: {num_predict: 4096}}')" \
+            AUTO_PROMPT_TEXT=$(jq -nc --arg model "$OLLAMA_MODEL" --rawfile prompt "$OLLAMA_PROMPT_FILE" \
+                    '{model: $model, messages: [{role: "system", content: "/no_think"}, {role: "user", content: $prompt}], stream: false, think: false, options: {num_predict: 4096}}' \
+                | curl -s --max-time 600 http://localhost:11434/api/chat -H 'Content-Type: application/json' -d @- \
                 | jq -r '.message.content // empty' 2>/dev/null \
                 | sed $'s/\033\[[0-9;]*[a-zA-Z]//g' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
             rm -f "$OLLAMA_PROMPT_FILE"
@@ -667,9 +667,9 @@ SUMMARY_PROMPT
             cat "$OUTPUT_FILE" >> "$SUMMARY_PROMPT_FILE"
             echo "---" >> "$SUMMARY_PROMPT_FILE"
 
-            SUMMARY_TEXT=$(curl -s --max-time 300 http://localhost:11434/api/chat \
-                -d "$(jq -nc --arg model "$OLLAMA_MODEL" --rawfile prompt "$SUMMARY_PROMPT_FILE" \
-                    '{model: $model, messages: [{role: "system", content: "/no_think"}, {role: "user", content: $prompt}], stream: false, think: false, options: {num_predict: 4096}}')" \
+            SUMMARY_TEXT=$(jq -nc --arg model "$OLLAMA_MODEL" --rawfile prompt "$SUMMARY_PROMPT_FILE" \
+                    '{model: $model, messages: [{role: "system", content: "/no_think"}, {role: "user", content: $prompt}], stream: false, think: false, options: {num_predict: 4096}}' \
+                | curl -s --max-time 600 http://localhost:11434/api/chat -H 'Content-Type: application/json' -d @- \
                 | jq -r '.message.content // empty' 2>/dev/null \
                 | sed $'s/\033\[[0-9;]*[a-zA-Z]//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             rm -f "$SUMMARY_PROMPT_FILE"
